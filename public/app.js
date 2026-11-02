@@ -34,7 +34,7 @@ volume = Math.max(0, Math.min(100, volume));
 let unmutedVolume = volume || 70;
 let playlistWidget, playlistGeneration = 0, playlistTracks = [], playlistTimer;
 let finishingTrackId = null, endPauseTimer;
-let finishingPlaybackGeneration = null, pauseBlockedUntil = 0, pauseCooldownTimer;
+let finishingPlaybackGeneration = null, pauseBlockedUntil = 0, pauseCooldownTimer, pauseCooldownMessage = '';
 let autoplayProbeTimer, needsAudioClick = false, finishCheck = null;
 let transitionConfirmUntil = 0, lastProgressPosition = null, lastProgressAt = -Infinity;
 const isHost = () => room?.hostId === clientId;
@@ -43,7 +43,7 @@ const currentTrack = () => room?.queue.find((track) => track.id === room.current
 const playbackState = () => pendingIntent?.trackId === room?.currentTrackId ? pendingIntent : room?.playback;
 const playbackGeneration = () => room?.playback?.generation ?? 0;
 const listenerCount = () => room?.members?.filter((member) => member.connected).length || 1;
-const pauseCoolingDown = () => !(isHost() && listenerCount() === 1) && serverNow() < pauseBlockedUntil;
+const pauseCoolingDown = () => !isHost() && serverNow() < pauseBlockedUntil;
 const targetPosition = () => {
   if (!room) return 0;
   const state = playbackState();
@@ -242,6 +242,19 @@ function errorAt(id, message = '') {
   $(id).textContent = message;
   $(id).hidden = !message;
 }
+function clearPauseCooldown() {
+  pauseBlockedUntil = 0;
+  clearTimeout(pauseCooldownTimer);
+  pauseCooldownTimer = null;
+  if (pauseCooldownMessage) {
+    if ($('toast').textContent === pauseCooldownMessage) {
+      clearTimeout(toastTimer);
+      $('toast').hidden = true;
+    }
+    if ($('queue-error').textContent === pauseCooldownMessage) errorAt('queue-error');
+    pauseCooldownMessage = '';
+  }
+}
 function connectionLabel(label, online = false) {
   $('connection').classList.toggle('online', online);
   $('connection').replaceChildren(Object.assign(document.createElement('i'), {}), document.createTextNode(label));
@@ -357,8 +370,7 @@ function showJoin(id) {
   $('join-name').focus();
 }
 function openRoom(id, name) {
-  pauseBlockedUntil = 0;
-  clearTimeout(pauseCooldownTimer);
+  clearPauseCooldown();
   roomId = id;
   displayName = name.trim().slice(0, 24) || 'User';
   storage.set('name', displayName);
@@ -399,16 +411,19 @@ function connect() {
       return;
     }
     if (message.type === 'error') {
-      if (message.code === 'pause_rate_limited') {
-        pauseBlockedUntil = serverNow() + Math.max(0, Math.min(60000, Number(message.retryAfterMs) || 10000));
-        clearTimeout(pauseCooldownTimer);
-        pauseCooldownTimer = setTimeout(() => { pauseBlockedUntil = 0; renderControls(); }, Math.max(0, pauseBlockedUntil - serverNow()));
+      const cooldownError = message.code === 'pause_rate_limited';
+      if (cooldownError) {
+        clearPauseCooldown();
+        // A delayed guest rejection must never lock a newly promoted host.
+        if (isHost()) { renderControls(); return; }
+        pauseBlockedUntil = serverNow() + Math.max(0, Math.min(5000, Number(message.retryAfterMs) || 5000));
+        pauseCooldownMessage = message.message;
+        pauseCooldownTimer = setTimeout(() => { clearPauseCooldown(); renderControls(); }, Math.max(0, pauseBlockedUntil - serverNow()));
         toast(message.message);
-      }
+      } else errorAt('queue-error', message.message);
       if (pendingIntent) { clearIntent(); invalidateReconcile(); renderControls(); reconcile(true); }
-      errorAt('queue-error', message.message);
       renderControls();
-      if (!joinedOnce || !connected) toast(message.message);
+      if (!cooldownError && (!joinedOnce || !connected)) toast(message.message);
       // Join failures must not reconnect forever or silently claim to be connected.
       if (!connected) {
         stopped = true;
@@ -434,6 +449,7 @@ function connect() {
     }
     if (!clockSamples.length) clockOffset = message.serverTime - Date.now();
     room = message.room;
+    if (isHost()) clearPauseCooldown();
     lastRevision = room.revision;
     connected = true;
     reconnectDelay = 600;
@@ -992,8 +1008,7 @@ $('import-playlist-button').addEventListener('click', () => {
 });
 $('cancel-playlist-button').addEventListener('click', closePlaylist);
 function leaveRoom() {
-  pauseBlockedUntil = 0;
-  clearTimeout(pauseCooldownTimer);
+  clearPauseCooldown();
   stopped = true;
   clearTimeout(reconnectTimer);
   clearInterval(pingTimer);
@@ -1021,7 +1036,7 @@ function closeRoom(message) {
   connected = false;
   clearTimeout(reconnectTimer);
   clearInterval(pingTimer);
-  clearTimeout(pauseCooldownTimer);
+  clearPauseCooldown();
   clearTimeout(autoplayProbeTimer);
   clearTimeout(toastTimer);
   const previous = socket;

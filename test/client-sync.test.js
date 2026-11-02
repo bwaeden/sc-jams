@@ -822,21 +822,71 @@ test('two-person guests can skip directly and a new song clears the vote display
   assert.equal(b.element('skip-vote-panel').hidden, true);
 });
 
-test('pause cooldown leaves other controls available and a solo host is exempt', () => {
+test('guest cooldown expires with its message and leaves other controls available', () => {
   const b = browser();
   b.app.connect();
-  const widget = load(b, lobby(b, { host: true }));
+  const widget = load(b, lobby(b));
   resolvePositions(widget);
-  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 10000 }) });
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 5000 }) });
   assert.equal(b.element('play-button').disabled, true);
   assert.equal(b.element('skip-button').disabled, false);
   assert.equal(b.element('volume').disabled, false);
-  receive(b, lobby(b, { host: true, count: 1, revision: 2 }));
-  resolvePositions(widget);
+  assert.notEqual(b.element('queue-error').textContent, 'Please wait.', 'playback cooldown is not a persistent queue error');
+  assert.equal(b.element('toast').hidden, false);
+  b.advance(5000);
+  b.timeout(5000);
+  assert.equal(b.element('toast').hidden, true);
+  assert.equal(b.element('role-hint').textContent, 'Everyone can play and pause.');
   assert.equal(b.element('play-button').disabled, false);
   b.messages.length = 0;
   b.event('play-button', 'click');
   assert.equal(b.messages.filter((message) => message.action === 'pause').length, 1);
+});
+
+test('the host remains exempt from cooldown in a populated room', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b, { host: true }));
+  resolvePositions(widget);
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 5000 }) });
+  assert.equal(b.element('play-button').disabled, false);
+  assert.notEqual(b.element('toast').textContent, 'Please wait.');
+  assert.equal(b.hasTimeout(5000), false);
+  b.messages.length = 0;
+  for (let index = 0; index < 10; index++) b.event('play-button', 'click');
+  assert.equal(b.messages.filter((message) => ['play', 'pause'].includes(message.action)).length, 10);
+});
+
+test('becoming host immediately clears a guest cooldown and ignores a delayed rejection', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b));
+  resolvePositions(widget);
+  const limited = { type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 5000 };
+  b.sockets[0].emit('message', { data: JSON.stringify(limited) });
+  assert.equal(b.element('play-button').disabled, true);
+  receive(b, lobby(b, { host: true, revision: 2 }));
+  resolvePositions(widget);
+  assert.equal(b.element('play-button').disabled, false);
+  assert.equal(b.hasTimeout(5000), false);
+  assert.notEqual(b.element('toast').textContent, 'Please wait.');
+  b.sockets[0].emit('message', { data: JSON.stringify(limited) });
+  assert.equal(b.element('play-button').disabled, false);
+  assert.equal(b.hasTimeout(5000), false);
+});
+
+test('cooldown expiry preserves a newer unrelated error message', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b));
+  resolvePositions(widget);
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 5000 }) });
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'queue_full', message: 'The queue is full (100 tracks).' }) });
+  b.advance(5000);
+  b.timeout(5000);
+  assert.equal(b.element('queue-error').textContent, 'The queue is full (100 tracks).');
+  assert.equal(b.element('queue-error').hidden, false);
+  assert.equal(b.element('play-button').disabled, false);
 });
 
 test('repeat and shuffle are host-only controls with authoritative room actions', () => {
@@ -949,7 +999,7 @@ test('native guest play resumes the shared room and both directions obey a coold
   assert.equal(b.messages.filter((message) => message.action === 'play').length, 1);
   receive(b, lobby(b, { playing: true, revision: 2 }));
   resolvePositions(widget);
-  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 10000 }) });
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 5000 }) });
   assert.equal(b.element('play-button').disabled, true);
   receive(b, lobby(b, { playing: false, revision: 3 }));
   resolvePositions(widget);

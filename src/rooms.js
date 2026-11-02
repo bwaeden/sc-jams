@@ -255,7 +255,7 @@ export function createRoomStore({
   }
 
   function limitPlayback(room, member) {
-    if (connectedMembers(room).length <= 1 && room.hostId === member.id) {
+    if (room.hostId === member.id) {
       member.pauseAttempts = [];
       member.pauseBlockedUntil = 0;
       return;
@@ -264,10 +264,15 @@ export function createRoomStore({
     if (member.pauseBlockedUntil > timestamp) {
       throw new RoomError('pause_rate_limited', 'Play/pause is on cooldown. Please give the room a moment.', { retryAfterMs: member.pauseBlockedUntil - timestamp });
     }
-    member.pauseAttempts = (member.pauseAttempts || []).filter((at) => timestamp - at < 10_000);
-    if (member.pauseAttempts.length >= 4) {
-      member.pauseBlockedUntil = timestamp + 10_000;
-      throw new RoomError('pause_rate_limited', 'Play/pause is on cooldown. Please give the room a moment.', { retryAfterMs: 10_000 });
+    if (member.pauseBlockedUntil) {
+      member.pauseAttempts = [];
+      member.pauseBlockedUntil = 0;
+    }
+    member.pauseAttempts = (member.pauseAttempts || []).filter((at) => timestamp - at < 1000);
+    // Allow three complete pause/resume cycles before blocking the next request.
+    if (member.pauseAttempts.length >= 6) {
+      member.pauseBlockedUntil = timestamp + 5000;
+      throw new RoomError('pause_rate_limited', 'Play/pause is on cooldown. Please give the room a moment.', { retryAfterMs: 5000 });
     }
     member.pauseAttempts.push(timestamp);
   }

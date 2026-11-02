@@ -161,6 +161,8 @@ test('playlist imports enforce the queue cap without partially appending tracks'
   host.send({ type: 'add_many', tracks: [...tracks.slice(0, 1), { url: TRACK_A }] });
   const full = await guest.state((room) => room.queue.length === 100);
   assert.equal(full.room.queue.at(-1).url, TRACK_A);
+  host.send({ type: 'add', url: TRACK_B });
+  assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'queue_full');
 });
 
 test('guests cannot seek, remove tracks, or publish host position', async (t) => {
@@ -459,7 +461,7 @@ async function barrier(peer) {
   await peer.waitFor((message) => message.type === 'pong' && message.sentAt === sentAt);
 }
 
-test('guest pause uses the server timeline, is spam-limited, and solo hosts remain exempt', async (t) => {
+test('guest pause uses the server timeline and hosts are exempt even while a guest is limited', async (t) => {
   let timestamp = 10_000;
   const { roomId, host, connect } = await fixture(t, { now: () => timestamp });
   const queued = await addQueue(host, 2);
@@ -472,28 +474,25 @@ test('guest pause uses the server timeline, is spam-limited, and solo hosts rema
   let paused = await host.state((room) => !room.playback.playing && room.revision > playing.room.revision);
   assert.equal(paused.room.playback.positionMs, 7000, 'guest offsets cannot seek the shared song');
   assert.equal(paused.room.playback.generation, queued.room.playback.generation);
-  for (let index = 0; index < 3; index++) {
-    guest.send({ type: 'control', action: 'pause' });
+  for (let index = 0; index < 5; index++) {
+    guest.send({ type: 'control', action: index % 2 ? 'pause' : 'play' });
     paused = await host.state((room) => room.revision > paused.room.revision);
   }
   guest.send({ type: 'control', action: 'pause' });
   const limited = await guest.waitFor((message) => message.type === 'error');
   assert.equal(limited.code, 'pause_rate_limited');
-  assert.equal(limited.retryAfterMs, 10000);
-  // The other person has a separate allowance, including when that person hosts.
-  for (let index = 0; index < 3; index++) {
-    host.send({ type: 'control', action: 'pause' });
+  assert.equal(limited.retryAfterMs, 5000);
+  for (let index = 0; index < 20; index++) {
+    host.send({ type: 'control', action: index % 2 ? 'pause' : 'play' });
     paused = await host.state((room) => room.revision > paused.room.revision);
   }
-  host.send({ type: 'control', action: 'pause' });
-  assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'pause_rate_limited');
   guest.close();
   paused = await host.state((room) => room.members.filter((member) => member.connected).length === 1 && room.revision > paused.room.revision);
   for (let index = 0; index < 7; index++) {
     host.send({ type: 'control', action: 'pause' });
     paused = await host.state((room) => room.revision > paused.room.revision);
   }
-  timestamp += 10001;
+  timestamp += 5000;
   const rejoined = connect(guest.identity);
   await rejoined.join(roomId);
   rejoined.send({ type: 'control', action: 'pause' });
@@ -652,7 +651,7 @@ test('shuffle changes only upcoming order and queue attribution survives departu
   assert.equal(shuffled.room.queue.find((track) => track.id === theirs.id).addedByName, 'Queued by Alex');
 });
 
-test('guests can pause and resume, both actions share a cooldown, and reconnect cannot reset it', async (t) => {
+test('guests get three pause/resume cycles per second and a five-second cooldown survives reconnect', async (t) => {
   let timestamp = 10_000;
   const { roomId, host, connect } = await fixture(t, { now: () => timestamp });
   host.send({ type: 'add', url: TRACK_A });
@@ -667,23 +666,76 @@ test('guests can pause and resume, both actions share a cooldown, and reconnect 
   guest.send({ type: 'control', action: 'play', positionMs: 90000 });
   const resumed = await guest.state((room) => room.playback.playing && room.revision > paused.room.revision);
   assert.equal(resumed.room.playback.positionMs, 2000, 'a guest resume cannot seek');
-  guest.send({ type: 'control', action: 'pause' });
-  const nextPause = await guest.state((room) => !room.playback.playing && room.revision > resumed.room.revision);
-  guest.send({ type: 'control', action: 'play' });
-  await guest.state((room) => room.playback.playing && room.revision > nextPause.room.revision);
+  // The earlier pause is outside the one-second window. The resume starts a
+  // fresh allowance, and five more toggles must succeed within the same second.
+  let latest = resumed;
+  for (let index = 0; index < 5; index++) {
+    guest.send({ type: 'control', action: index % 2 ? 'play' : 'pause' });
+    latest = await guest.state((room) => room.revision > latest.room.revision);
+  }
+  assert.equal(latest.room.playback.playing, false);
   guest.send({ type: 'control', action: 'pause' });
   const limited = await guest.waitFor((message) => message.type === 'error');
   assert.equal(limited.code, 'pause_rate_limited');
-  assert.equal(limited.retryAfterMs, 10000);
+  assert.equal(limited.retryAfterMs, 5000);
   guest.close();
   await host.state((room) => !room.members.some((member) => member.id === guest.identity.clientId));
   const returned = connect(guest.identity);
   await returned.join(roomId);
   returned.send({ type: 'control', action: 'play' });
   assert.equal((await returned.waitFor((message) => message.type === 'error')).code, 'pause_rate_limited');
-  timestamp += 10001;
-  returned.send({ type: 'control', action: 'pause' });
-  await returned.state((room) => !room.playback.playing);
+  timestamp += 4999;
+  returned.send({ type: 'control', action: 'play' });
+  assert.equal((await returned.waitFor((message) => message.type === 'error')).retryAfterMs, 1, 'rejected requests do not extend the cooldown');
+  timestamp += 1;
+  const rejoined = await host.state((room) => room.members.some((member) => member.id === guest.identity.clientId) && room.revision > latest.room.revision);
+  latest = rejoined;
+  for (let index = 0; index < 6; index++) {
+    returned.send({ type: 'control', action: index % 2 ? 'pause' : 'play' });
+    latest = await returned.state((room) => room.revision > latest.room.revision);
+  }
+  returned.send({ type: 'control', action: 'play' });
+  assert.equal((await returned.waitFor((message) => message.type === 'error')).retryAfterMs, 5000, 'the entire allowance is restored after cooldown');
+});
+
+test('guest toggle allowance uses a rolling one-second window', async (t) => {
+  let timestamp = 10_000;
+  const { roomId, host, connect } = await fixture(t, { now: () => timestamp });
+  await addQueue(host, 1);
+  const guest = connect();
+  let latest = await guest.join(roomId);
+  for (let index = 0; index < 6; index++) {
+    guest.send({ type: 'control', action: index % 2 ? 'play' : 'pause' });
+    latest = await guest.state((room) => room.revision > latest.room.revision);
+  }
+  timestamp += 1000;
+  for (let index = 0; index < 6; index++) {
+    guest.send({ type: 'control', action: index % 2 ? 'play' : 'pause' });
+    latest = await guest.state((room) => room.revision > latest.room.revision);
+  }
+  assert.equal(guest.inbox.some((message) => message.type === 'error'), false);
+});
+
+test('a limited guest promoted to host can immediately play and pause without a cooldown', async (t) => {
+  const { roomId, host, connect } = await fixture(t, { now: () => 10_000 });
+  await addQueue(host, 1);
+  const guest = connect(), other = connect();
+  let latest = await guest.join(roomId);
+  await other.join(roomId);
+  latest = await guest.state((room) => room.members.length === 3);
+  for (let index = 0; index < 6; index++) {
+    guest.send({ type: 'control', action: index % 2 ? 'play' : 'pause' });
+    latest = await guest.state((room) => room.revision > latest.room.revision);
+  }
+  guest.send({ type: 'control', action: 'pause' });
+  assert.equal((await guest.waitFor((message) => message.type === 'error')).code, 'pause_rate_limited');
+  host.close();
+  latest = await guest.state((room) => room.hostId === guest.identity.clientId);
+  assert.equal(latest.room.members.length, 2, 'the new host is still in a shared room');
+  for (let index = 0; index < 12; index++) {
+    guest.send({ type: 'control', action: index % 2 ? 'play' : 'pause' });
+    latest = await guest.state((room) => room.revision > latest.room.revision);
+  }
 });
 
 test('adding, selecting, skipping and removing the current song all start playback', async (t) => {

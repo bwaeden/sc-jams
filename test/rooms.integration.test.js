@@ -799,6 +799,52 @@ test('host repeat modes loop the track or cycle the queue while explicit skip by
   assert.equal(cycled.room.playback.playing, true);
 });
 
+for (const mode of ['off', 'track', 'queue']) for (const count of [1, 3]) {
+  test(`natural completion then Skip keep playback running with ${count} queued track(s) and repeat ${mode}`, async (t) => {
+    const { app, roomId, host, connect } = await fixture(t);
+    const guest = connect({ name: 'Listening friend' });
+    await guest.join(roomId);
+    const queued = await addQueue(host, count);
+    if (mode !== 'off') {
+      host.send({ type: 'control', action: 'repeat', mode });
+      await guest.state((room) => room.repeatMode === mode);
+    }
+    const ids = queued.room.queue.map((track) => track.id);
+    const finish = { type: 'control', action: 'finish', trackId: ids[0], generation: queued.room.playback.generation };
+    host.send(finish);
+    const finished = await guest.state((room) => room.playback.generation === finish.generation + 1);
+    const afterFinish = count === 1 || mode === 'track' ? ids : [...ids.slice(1), ...(mode === 'queue' ? [ids[0]] : [])];
+    assert.deepEqual(finished.room.queue.map((track) => track.id), afterFinish);
+    assert.equal(finished.room.currentTrackId, afterFinish[0]);
+    assert.equal(finished.room.playback.playing, true);
+    assert.equal(finished.room.playback.positionMs, 0);
+    assert.equal(finished.room.repeatMode, mode);
+
+    // Old iframe callbacks and repeated clicks cannot consume the new generation,
+    // including when a single-track loop keeps the same track ID.
+    host.send(finish);
+    host.send({ ...finish, action: 'skip' });
+    await barrier(host);
+    assert.equal(app.rooms.get(roomId).revision, finished.room.revision);
+
+    const skip = { type: 'control', action: 'skip', trackId: finished.room.currentTrackId, generation: finished.room.playback.generation };
+    host.send(skip);
+    const skipped = await guest.state((room) => room.playback.generation === skip.generation + 1);
+    const afterSkip = afterFinish.length === 1 ? afterFinish : [...afterFinish.slice(1), ...(mode === 'queue' ? [afterFinish[0]] : [])];
+    assert.deepEqual(skipped.room.queue.map((track) => track.id), afterSkip, 'Skip bypasses track repeat while queue repeat rotates');
+    assert.equal(skipped.room.currentTrackId, afterSkip[0]);
+    assert.equal(skipped.room.playback.playing, true);
+    assert.equal(skipped.room.playback.positionMs, 0);
+    assert.equal(skipped.room.repeatMode, mode);
+
+    host.send(skip);
+    host.send({ ...skip, action: 'finish' });
+    await barrier(host);
+    assert.equal(app.rooms.get(roomId).revision, skipped.room.revision);
+    assert.equal(app.rooms.get(roomId).playback.playing, true);
+  });
+}
+
 test('shuffle changes only upcoming order and queue attribution survives departure or forged metadata', async (t) => {
   const { roomId, host, connect } = await fixture(t, { random: () => 0.99 });
   const queued = await addQueue(host, 4);

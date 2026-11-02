@@ -58,7 +58,7 @@ volume = Math.max(0, Math.min(100, volume));
 let unmutedVolume = volume || 70;
 let playlistWidget, playlistGeneration = 0, playlistTracks = [], playlistTimer;
 let playlistCandidates = [], playlistSourceCount = 0, playlistUnavailableCount = 0, playlistReady = false;
-let finishingTrackId = null, endPauseTimer;
+let finishingTrackId = null, endPauseTimer, endPausePosition;
 let finishingPlaybackGeneration = null, pauseBlockedUntil = 0, pauseCooldownTimer, pauseCooldownMessage = '';
 let autoplayProbeTimer, needsAudioClick = false, finishCheck = null;
 let transitionConfirmUntil = 0, lastProgressPosition = null, lastProgressAt = -Infinity;
@@ -98,6 +98,10 @@ function consumeWidgetEvent(type, positionMs) {
   widgetEchoes.splice(index, 1);
   return true;
 }
+function nearTrackEnd(position) {
+  // Progress events are sampled; the last one need not land in the final frame.
+  return Number.isFinite(position) && position > 0 && knownDuration > 0 && position >= knownDuration - Math.min(1500, knownDuration / 4);
+}
 function handleNativePlayback(playing, event = {}) {
   // A background iframe can be interrupted by the browser or another player.
   // Its local audio state must not become a play/pause command for everyone.
@@ -118,15 +122,16 @@ function handleNativePlayback(playing, event = {}) {
     if (actualPlaying) confirmPlaying();
     // Natural endings can emit PAUSE before FINISH. Scope the grace period to
     // this load, so a delayed ending cannot pause a newly started song or loop.
-    if (!actualPlaying && playbackState()?.playing && knownDuration > 0 && actualPosition >= knownDuration - 350) {
+    if (!actualPlaying && playbackState()?.playing && nearTrackEnd(actualPosition)) {
       clearTimeout(endPauseTimer);
       invalidateReconcile();
       nativeCheck = null;
       const generation = loadGeneration;
+      endPausePosition = actualPosition;
       endPauseTimer = setTimeout(() => {
         endPauseTimer = null;
         if (generation === loadGeneration && !finishingTrackId && !finishCheck) hostIntent('pause', actualPosition, false);
-      }, 180);
+      }, 1500);
       return;
     }
     if (eventsAllowed(actualPlaying ? 'play' : 'pause') && playbackState().playing !== actualPlaying) hostIntent(actualPlaying ? 'play' : 'pause', actualPosition, false);
@@ -219,6 +224,8 @@ function hostIntent(action, positionMs, commandPlayer = true) {
   if ((!isHost() && !['play', 'pause'].includes(action)) || !connected || !playerReady || !currentTrack()) return;
   if (['play', 'pause'].includes(action) && pauseCoolingDown()) { reconcile(true); return; }
   const previous = playbackState();
+  clearTimeout(endPauseTimer);
+  endPauseTimer = null;
   nativeCheck = null;
   finishCheck = null;
   const playing = action === 'play' ? true : action === 'pause' ? false : previous.playing;
@@ -868,26 +875,35 @@ function loadTrack(track, force = false) {
       if (eventsAllowed('seek') && Math.abs(lastPosition - targetPosition()) > 250) hostIntent('seek', lastPosition, false);
       else if (!isHost()) setTimeout(() => reconcile(true), 100);
     });
-    instance.bind(events.FINISH, () => {
+    instance.bind(events.FINISH, (event = {}) => {
       if (!valid() || !playerReady || !connected || !playbackState()?.playing || finishCheck || finishingTrackId === track.id) return;
+      const pausedAtEnd = Boolean(endPauseTimer && nearTrackEnd(endPausePosition));
       clearTimeout(endPauseTimer);
       endPauseTimer = null;
       nativeCheck = null;
       invalidateReconcile();
-      const recentEnd = knownDuration > 0 && lastProgressPosition >= knownDuration - 350 && performance.now() - lastProgressAt < 2000;
+      const inTransition = Boolean(previousInstance) && performance.now() <= transitionConfirmUntil;
+      const recentEnd = nearTrackEnd(lastProgressPosition) && performance.now() - lastProgressAt < 10000;
+      // FINISH can carry the final position even after getPosition has reset to
+      // zero. During a new load/loop, ignore payloads left over from the old song.
+      const reportedEnd = !inTransition && (nearTrackEnd(event.currentPosition) || event.relativePosition >= 0.999);
       const check = { instance, generation };
       finishCheck = check;
+      const hasEndEvidence = () => pausedAtEnd || recentEnd || reportedEnd || (!inTransition && check.nativeEvent?.playing === false && nearTrackEnd(check.nativeEvent.event?.currentPosition ?? lastPosition));
       instance.getPosition((position) => {
         if (finishCheck !== check || !valid() || !connected) return;
         finishCheck = null;
         // Reused widgets can deliver a previous song's FINISH after load/seek.
         // Only the current audio actually reaching its end may advance a queue.
-        if (playbackState()?.playing && (recentEnd || (knownDuration ? position >= knownDuration - 350 : position > 0))) finishCurrentTrack();
+        if (playbackState()?.playing && (hasEndEvidence() || (!inTransition && (knownDuration ? nearTrackEnd(position) : position > 0)))) finishCurrentTrack();
         else if (check.nativeEvent) handleNativePlayback(check.nativeEvent.playing, check.nativeEvent.event);
       });
       setTimeout(() => {
-        if (finishCheck !== check || !valid()) return;
+        if (finishCheck !== check || !valid() || !connected) return;
         finishCheck = null;
+        // A missing cross-frame getter must not strand a completed queue. The
+        // same end evidence is safe only while this load is still current.
+        if (playbackState()?.playing && hasEndEvidence()) { finishCurrentTrack(); return; }
         if (check.nativeEvent) handleNativePlayback(check.nativeEvent.playing, check.nativeEvent.event);
         reconcile(true);
       }, 2000);
@@ -1064,6 +1080,10 @@ $('play-button').addEventListener('click', () => {
 $('skip-button').addEventListener('click', () => {
   if ($('skip-button').disabled) return;
   if (isHost() || listenerCount() <= 2) {
+    clearTimeout(endPauseTimer);
+    endPauseTimer = null;
+    finishCheck = null;
+    nativeCheck = null;
     clearIntent();
     invalidateReconcile();
   }

@@ -842,7 +842,7 @@ test('a deliberate native pause near the end still pauses when no FINISH follows
   widget.emit(EVENTS.PAUSE, { currentPosition: 239950 });
   b.interval(2500);
   assert.equal(widget.pendingPositions.length, 0, 'sync cannot restart the track while its end-state is being resolved');
-  b.timeout(180);
+  b.timeout(1500);
   assert.equal(b.messages.filter((message) => message.action === 'pause').length, 1);
   assert.equal(b.app.status().pendingIntent.playing, false);
 });
@@ -1273,6 +1273,7 @@ test('same-track generations restart a looping song and reject old completion ca
   first.resolvePosition(0);
   assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
   b.flushWidgetEvents();
+  b.advance(2000); // A real restarted song must get beyond its startup transition.
   restarted.emit(EVENTS.FINISH);
   restarted.emit(EVENTS.FINISH);
   restarted.resolvePosition(240000);
@@ -1392,7 +1393,9 @@ test('late previous-generation PAUSE and FINISH cannot stop or consume a playing
   widget.emit(EVENTS.FINISH);
   widget.resolvePosition(0);
   assert.equal(widget.paused, false);
-  assert.equal(b.hasTimeout(180), false);
+  // A completed native-state confirmation may retain its no-op timeout; run
+  // it to prove it cannot publish a pause or consume the restarted generation.
+  if (b.hasTimeout(1500)) b.timeout(1500);
   assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
 });
 
@@ -1409,6 +1412,159 @@ test('recent measured end progress validates FINISH when SoundCloud has reset it
   assert.equal(b.messages.find((message) => message.action === 'finish')?.generation, 4);
 });
 
+test('coarse final progress and a positionless natural PAUSE cannot stop queued autoplay', () => {
+  const b = browser();
+  const initial = lobby(b, { host: true, generation: 4 });
+  initial.queue.push(track('track-b'));
+  const widget = load(b, initial);
+  resolvePositions(widget);
+  b.advance(2000);
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239000 });
+  b.advance(100);
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239500 });
+  b.advance(600);
+  b.messages.length = 0;
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE);
+  assert.equal(b.messages.filter((message) => message.action === 'pause').length, 0);
+  widget.emit(EVENTS.FINISH);
+  widget.resolvePosition(0);
+  assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['finish']);
+  assert.equal(b.messages.find((message) => message.action === 'finish').generation, 4);
+});
+
+test('credible natural completion advances when the widget position getter never responds', () => {
+  const b = browser();
+  const widget = load(b, lobby(b, { host: true, generation: 4 }));
+  resolvePositions(widget);
+  b.advance(2000);
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239000 });
+  b.advance(100);
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239500 });
+  b.advance(600);
+  b.messages.length = 0;
+  widget.emit(EVENTS.FINISH);
+  b.timeout(2000);
+  assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['finish']);
+  widget.resolvePosition(0);
+  assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1, 'the late getter cannot complete the same generation twice');
+});
+
+test('FINISH payload proves completion when the player resets and final progress was omitted', () => {
+  for (const payload of [{ currentPosition: 240000 }, { relativePosition: 1 }]) {
+    const b = browser();
+    const widget = load(b, lobby(b, { host: true, generation: 5 }));
+    resolvePositions(widget);
+    b.advance(2000);
+    b.messages.length = 0;
+    widget.emit(EVENTS.FINISH, payload);
+    widget.resolvePosition(0);
+    assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
+    assert.equal(b.messages.find((message) => message.action === 'finish').generation, 5);
+  }
+});
+
+test('a natural PAUSE can precede FINISH by half a second without pausing the shared room', () => {
+  const b = browser();
+  const widget = load(b, lobby(b, { host: true }));
+  resolvePositions(widget);
+  b.advance(2000);
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239000 });
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239500 });
+  b.messages.length = 0;
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE);
+  assert.equal(b.hasTimeout(180), false, 'the old short grace cannot race a delayed iframe event');
+  assert.equal(b.hasTimeout(1500), true);
+  b.advance(500);
+  widget.emit(EVENTS.FINISH);
+  widget.resolvePosition(0);
+  assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['finish']);
+});
+
+test('a held final PAUSE proves completion when FINISH resets before the last progress sample', () => {
+  for (const timedOut of [false, true]) {
+    const b = browser();
+    const widget = load(b, lobby(b, { host: true }));
+    resolvePositions(widget);
+    b.advance(2000);
+    b.messages.length = 0;
+    widget.paused = true;
+    widget.emit(EVENTS.PAUSE, { currentPosition: 240000 });
+    b.advance(100);
+    widget.emit(EVENTS.FINISH);
+    if (timedOut) b.timeout(2000);
+    else widget.resolvePosition(0);
+    assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['finish']);
+  }
+});
+
+test('explicit site Pause wins while a natural completion getter is pending', () => {
+  const b = browser();
+  const widget = load(b, lobby(b, { host: true }));
+  resolvePositions(widget);
+  b.advance(2000);
+  b.messages.length = 0;
+  widget.emit(EVENTS.FINISH, { currentPosition: 240000 });
+  b.event('play-button', 'click');
+  widget.resolvePosition(240000);
+  b.timeout(2000);
+  assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['pause']);
+  assert.equal(b.app.status().pendingIntent.playing, false);
+});
+
+test('old FINISH payloads cannot consume a newly skipped track or a restarted loop', () => {
+  for (const id of ['track-a', 'track-b']) for (const oldPosition of [0, 240000]) {
+    const b = browser();
+    b.app.connect();
+    const widget = load(b, lobby(b, { host: true, generation: 1 }));
+    resolvePositions(widget);
+    b.advance(2000);
+    widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239900 });
+    b.event('skip-button', 'click');
+    receive(b, lobby(b, { host: true, id, position: 0, revision: 2, generation: 2 }));
+    if (id === 'track-b') widget.emit(EVENTS.READY);
+    resolvePositions(widget, 0);
+    b.messages.length = 0;
+    widget.emit(EVENTS.FINISH, { currentPosition: 240000, relativePosition: 1 });
+    widget.resolvePosition(oldPosition);
+    assert.equal(b.messages.filter((message) => message.action === 'finish').length, 0, `old end payload/getter ${oldPosition} must not consume ${id}`);
+    assert.equal(widget.paused, false);
+  }
+});
+
+test('a pending completion timeout cannot affect the next track after Skip', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b, { host: true, generation: 1 }));
+  resolvePositions(widget);
+  b.advance(2000);
+  widget.emit(EVENTS.FINISH, { currentPosition: 240000 });
+  b.event('skip-button', 'click');
+  receive(b, lobby(b, { host: true, id: 'track-b', position: 0, revision: 2, generation: 2 }));
+  widget.emit(EVENTS.READY);
+  resolvePositions(widget, 0);
+  b.messages.length = 0;
+  b.timeout(2000);
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
+  assert.equal(b.app.status().loadedTrackId, 'track-b');
+  assert.equal(widget.paused, false);
+});
+
+test('Skip cancels a pending end PAUSE before a delayed server acknowledgment', () => {
+  const b = browser();
+  const widget = load(b, lobby(b, { host: true }));
+  resolvePositions(widget);
+  b.advance(2000);
+  b.messages.length = 0;
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE, { currentPosition: 240000 });
+  assert.equal(b.hasTimeout(1500), true);
+  b.event('skip-button', 'click');
+  assert.equal(b.hasTimeout(1500), false, 'the old end pause cannot be sent after the server has already skipped');
+  assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['skip']);
+});
+
 test('a pending finish confirmation never broadcasts its natural PAUSE before advancing', () => {
   const b = browser();
   const widget = load(b, lobby(b, { host: true }));
@@ -1418,7 +1574,7 @@ test('a pending finish confirmation never broadcasts its natural PAUSE before ad
   widget.emit(EVENTS.FINISH);
   widget.paused = true;
   widget.emit(EVENTS.PAUSE, { currentPosition: 240000 });
-  assert.equal(b.hasTimeout(180), false);
+  assert.equal(b.hasTimeout(1500), false);
   widget.resolvePosition(240000);
   assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['finish']);
 });

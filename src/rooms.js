@@ -444,9 +444,28 @@ export function createRoomStore({
     for (const room of rooms.values()) if (!expire(room)) pruneIdentities(room);
   }
 
+  function hydrateTracks(room, updates) {
+    if (rooms.get(room.id) !== room || expire(room)) return false;
+    let modified = false;
+    for (const update of updates) {
+      const track = room.queue.find((item) => item.id === update.trackId && item.url === update.url);
+      if (!track || !update.metadata || typeof update.metadata !== 'object') continue;
+      let details;
+      try { details = metadata(update.metadata); } catch { continue; }
+      if (new URL(track.url).hostname === 'api.soundcloud.com') details.soundcloudId = new URL(track.url).pathname.split('/').at(-1);
+      for (const [key, value] of Object.entries(details)) {
+        if (track[key] === value) continue;
+        track[key] = value;
+        modified = true;
+      }
+    }
+    if (modified) changed(room);
+    return modified;
+  }
+
   function close() {
     rooms.clear();
   }
 
-  return { rooms, create, get, snapshot, join, leave, apply, cleanup, close };
+  return { rooms, create, get, snapshot, join, leave, apply, hydrateTracks, cleanup, close };
 }

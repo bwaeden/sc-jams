@@ -323,6 +323,13 @@ function applyTheme(theme) {
   $('theme-toggle').setAttribute('aria-pressed', String(theme === 'dark'));
   storage.set('theme', theme);
 }
+function playerOptions(playing = false) {
+  return { auto_play: Boolean(playing), single_active: false, color: '#f5613c', hide_related: true, show_teaser: false, show_comments: false, show_user: true, show_reposts: false, visual: false };
+}
+function playerUrl(url, playing = false) {
+  const parameters = Object.entries({ url, ...playerOptions(playing) }).map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join('&');
+  return `https://w.soundcloud.com/player/?${parameters}`;
+}
 function closePlaylist() {
   playlistGeneration++;
   clearTimeout(playlistTimer);
@@ -370,7 +377,7 @@ function previewPlaylist(url) {
   iframe.title = 'SoundCloud playlist import preview';
   iframe.height = '166';
   iframe.scrolling = 'no';
-  iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(url)}&auto_play=false&single_active=false&color=%23f5613c&show_comments=false&visual=false`;
+  iframe.src = playerUrl(url);
   $('playlist-preview').replaceChildren(iframe);
   const instance = window.SC.Widget(iframe);
   playlistWidget = instance;
@@ -740,7 +747,8 @@ function loadTrack(track, force = false) {
   lastProgressPosition = null;
   lastProgressAt = -Infinity;
   if (previousInstance) {
-    previousInstance.pause();
+    // Loading a new source stops the old one. Pausing first can open
+    // SoundCloud's pause overlay, and loops only need to seek and play.
     for (const name of Object.values(window.SC.Widget.Events)) previousInstance.unbind(name);
   }
   $('empty-player').hidden = true;
@@ -756,7 +764,7 @@ function loadTrack(track, force = false) {
     iframe.allow = 'autoplay';
     iframe.height = '166';
     iframe.scrolling = 'no';
-    iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(track.url)}&auto_play=${Boolean(room?.playback.playing)}&single_active=false&color=%23f5613c&hide_related=true&show_comments=false&show_user=true&show_reposts=false&visual=false`;
+    iframe.src = playerUrl(track.url, room?.playback.playing);
     $('embed-container').replaceChildren(iframe);
   }
   function bindWidget(attempt = 0) {
@@ -863,7 +871,7 @@ function loadTrack(track, force = false) {
         const loadSource = () => {
           if (!valid()) return;
           widgetSourceUrl = track.url;
-          instance.load(track.url, { auto_play: Boolean(playbackState()?.playing), single_active: false, show_comments: false, visual: false, callback: () => {
+          instance.load(track.url, { ...playerOptions(playbackState()?.playing), callback: () => {
             // READY can precede hydrated sound details. Retry without accepting
             // the previous source or letting an old generation ready this one.
             const waitForSource = (attempt = 0) => {

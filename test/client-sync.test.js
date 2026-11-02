@@ -44,7 +44,7 @@ function browser({ saved = {}, asyncEvents = false, responses = {}, blockPlay = 
       bind(event, callback) { callbacks.set(event, callback); },
       unbind(event) { callbacks.delete(event); },
       blockPlay,
-      load(url, options) { this.calls.push({ method: 'load', url }); this.url = url; this.paused = true; callbacks.set(EVENTS.READY, options.callback); },
+      load(url, options) { this.calls.push({ method: 'load', url, options }); this.url = url; this.paused = true; callbacks.set(EVENTS.READY, options.callback); },
       emit(event, payload = {}) { callbacks.get(event)?.(payload); },
       getPosition(callback) { this.pendingPositions.push(callback); },
       resolvePosition(position) {
@@ -530,6 +530,54 @@ test('ID-only tracks autoplay and hydrate metadata, while stale sound details ca
   assert.equal(metadata.soundcloudId, '1803239802');
   assert.equal(metadata.permalinkUrl, 'https://soundcloud.com/artist/resolved-song');
   assert.ok(widget.calls.some((call) => call.method === 'load' && call.url === next.queue[0].url));
+});
+
+test('player recommendation and teaser settings persist across previews, track changes and loops', () => {
+  const b = browser();
+  b.app.connect();
+  b.app.previewPlaylist('https://soundcloud.com/artist/sets/a-playlist');
+  const preview = b.widgets.at(-1);
+  const previewUrl = new URL(preview.iframe.src);
+  assert.equal(previewUrl.searchParams.get('auto_play'), 'false');
+  assert.equal(previewUrl.searchParams.get('hide_related'), 'true');
+  assert.equal(previewUrl.searchParams.get('show_teaser'), 'false');
+  b.app.closePlaylist();
+  const widget = load(b, lobby(b, { host: true, generation: 1 }));
+  resolvePositions(widget);
+  const initialUrl = new URL(widget.iframe.src);
+  assert.equal(initialUrl.searchParams.get('hide_related'), 'true');
+  assert.equal(initialUrl.searchParams.get('show_teaser'), 'false');
+  widget.calls.length = 0;
+  receive(b, lobby(b, { host: true, id: 'track-b', position: 0, revision: 2, generation: 2 }));
+  const nextLoad = widget.calls.find((call) => call.method === 'load');
+  assert.equal(nextLoad.options.hide_related, true);
+  assert.equal(nextLoad.options.show_teaser, false);
+  assert.equal(nextLoad.options.show_reposts, false);
+  assert.equal(nextLoad.options.auto_play, true);
+  assert.equal(widget.calls.some((call) => call.method === 'pause'), false, 'switching tracks does not insert an overlay-triggering pause');
+  widget.emit(EVENTS.READY);
+  resolvePositions(widget, 0);
+  widget.calls.length = 0;
+  receive(b, lobby(b, { host: true, id: 'track-b', position: 0, revision: 3, generation: 3 }));
+  assert.equal(widget.calls.some((call) => call.method === 'pause'), false, 'looping also avoids an artificial pause');
+  assert.equal(widget.paused, false);
+});
+
+test('background titles update upcoming queue rows without changing or restarting the playing song', () => {
+  const b = browser();
+  b.app.connect();
+  const state = lobby(b, { host: true, generation: 1 });
+  state.queue.push({ ...track('imported-track'), url: 'https://api.soundcloud.com/tracks/1803239802', title: 'Playlist track 6' });
+  const widget = load(b, state);
+  resolvePositions(widget);
+  widget.calls.length = 0;
+  const updated = { ...state, revision: 2, queue: state.queue.map((track) => track.id === 'imported-track' ? { ...track, title: 'soser - who u love (prod. tdf)', artist: 'i love you' } : track) };
+  receive(b, updated);
+  resolvePositions(widget);
+  const queueTitle = b.element('queue').children[1].children[0].children[1].children[0];
+  assert.equal(queueTitle.textContent, 'soser - who u love (prod. tdf)');
+  assert.equal(b.app.status().loadedTrackId, state.currentTrackId);
+  assert.equal(widget.calls.some((call) => ['load', 'play', 'pause', 'seekTo'].includes(call.method)), false);
 });
 
 test('natural finish advances once and the next track starts at READY without waiting for a getter', () => {

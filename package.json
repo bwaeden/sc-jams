@@ -1,6 +1,6 @@
 {
   "name": "sc-jams",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "description": "Small, self-hostable listening rooms for SoundCloud.",
   "type": "module",
@@ -10,7 +10,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "test": "node --test",
-    "check": "node --check src/server.js && node --check src/rooms.js && node --check public/app.js && node --check public/theme.js && node --check public/icons.js && node --check public/support.js && node --check public/queue.js"
+    "check": "node --check src/server.js && node --check src/rooms.js && node --check src/soundcloud-metadata.js && node --check public/app.js && node --check public/theme.js && node --check public/icons.js && node --check public/support.js && node --check public/queue.js"
   },
   "dependencies": { "ws": "^8.18.3" }
 }

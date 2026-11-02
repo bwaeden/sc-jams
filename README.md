@@ -32,7 +32,7 @@ Listeners who leave the name blank appear as **User**. Session IDs are never use
 
 Use full URLs such as `https://soundcloud.com/artist/track` or `https://soundcloud.com/artist/sets/playlist`. Open shortened share links in SoundCloud first, then copy the full address. Private tracks, profile pages, and likes pages cannot be pasted as playlists.
 
-Playlist import uses the Widget API's `getSounds` result and adds individual public tracks. SoundCloud may supply full details for only the first five entries; the remaining ID-only entries are retained using the official player's supported numeric track references. Those entries initially show a playlist position, then their titles and artists update as they load for playback. No SoundCloud API credentials are needed for this import.
+Playlist import uses the Widget API's `getSounds` result and adds individual public tracks. SoundCloud may supply full details for only the first five entries; the remaining ID-only entries are retained using the official player's supported numeric track references. The server fetches titles, artists, and artwork in the background through SoundCloud's public [oEmbed endpoint](https://developers.soundcloud.com/docs/oembed), so upcoming queue entries gain their names without needing to play first. Lookups use a small worker pool and a bounded cache shared across rooms. Failed lookups leave a fallback title that the player can replace later. No SoundCloud API credentials are needed for this import.
 
 Duplicate tracks are omitted, and the shared queue holds at most 100 tracks, including the current track. Import fills the available spaces and reports entries that cannot fit: a 115-track playlist in an empty room offers **Add 100 tracks** and explains that 15 exceed the limit. Capacity updates if someone changes the queue while the preview is open. Restricted or unavailable tracks can still fail during playback.
 
@@ -65,6 +65,8 @@ Disconnected users leave the listener list immediately. If the host leaves, host
 ## Autoplay and inactive rooms
 
 The player attempts audio whenever the room starts or advances music, rather than relying on a previous local play flag. Browsers can still require a listener's first click before permitting audio. In that case the site shows **Enable listening**; it does not report blocked audio as successfully playing. SoundCloud controls availability and any advertising in its player.
+
+Initial players, playlist previews, and subsequent track loads consistently request hidden recommendations and disabled discovery teasers. Transitions avoid inserting an artificial pause before a load or loop. SoundCloud still controls the iframe: its [overlay settings](https://help.soundcloud.com/hc/en-us/articles/115003566828-The-Visual-embedded-player) can depend on the creator's account, so sc jams cannot guarantee removal of every provider message.
 
 Rooms close after 30 minutes without music activity. Paused or empty rooms expire even if a browser stays connected; pings, metadata, and queue reordering do not extend the timeout. Actual advancing player progress keeps an active room alive. A room with no listeners, or one whose browsers never started audio, cannot remain alive indefinitely just because its server playback flag is set.
 

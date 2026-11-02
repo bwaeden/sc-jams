@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createRoomStore, RoomError } from './rooms.js';
+import { createSoundCloudMetadataResolver } from './soundcloud-metadata.js';
 
 const PUBLIC_DIRECTORY = path.resolve(fileURLToPath(new URL('../public/', import.meta.url)));
 const MIME_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8' };
@@ -24,11 +25,42 @@ export function createJamServer({
   maxRooms = 1000,
   random = Math.random,
   publicOrigin = process.env.PUBLIC_ORIGIN,
+  lookupTrackMetadata = null,
 } = {}) {
   const creationLimits = new Map();
   let closing = false;
   let publicRoot;
   const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024, perMessageDeflate: false });
+  const metadataRequested = new WeakSet();
+  const metadataBatches = new Map();
+
+  function clearMetadataBatch(room) {
+    clearTimeout(metadataBatches.get(room.id)?.timer);
+    metadataBatches.delete(room.id);
+  }
+
+  function queueTrackMetadata(room) {
+    if (closing || typeof lookupTrackMetadata !== 'function') return;
+    for (const track of room.queue) {
+      if (metadataRequested.has(track) || new URL(track.url).hostname !== 'api.soundcloud.com') continue;
+      metadataRequested.add(track);
+      const url = track.url;
+      Promise.resolve().then(() => lookupTrackMetadata(url)).then((details) => {
+        if (closing || !details || store.rooms.get(room.id) !== room || !room.queue.includes(track) || track.url !== url) return;
+        let batch = metadataBatches.get(room.id);
+        if (!batch) {
+          batch = { updates: new Map(), timer: null };
+          metadataBatches.set(room.id, batch);
+          batch.timer = setTimeout(() => {
+            metadataBatches.delete(room.id);
+            if (!closing) store.hydrateTracks(room, [...batch.updates.values()]);
+          }, 250);
+          batch.timer.unref?.();
+        }
+        batch.updates.set(track.id, { trackId: track.id, url, metadata: details });
+      }).catch(() => { /* Titles can still arrive from the playback widget. */ });
+    }
+  }
 
   function send(socket, message) {
     if (socket.readyState !== WebSocket.OPEN) return;
@@ -37,6 +69,7 @@ export function createJamServer({
   }
 
   const store = createRoomStore({ now, roomIdleMs, maxRooms, random, onClose: (room) => {
+    clearMetadataBatch(room);
     for (const member of room.members.values()) {
       send(member.socket, { type: 'room_closed', reason: 'inactive', message: 'This room closed after 30 minutes without playback.' });
       member.socket.close(4004, 'Room inactive');
@@ -44,6 +77,7 @@ export function createJamServer({
   }, onChange: (room) => {
     const message = { type: 'state', serverTime: now(), room: store.snapshot(room) };
     for (const member of room.members.values()) if (member.connected) send(member.socket, message);
+    queueTrackMetadata(room);
   } });
 
   function allowedOrigin(request) {
@@ -190,6 +224,8 @@ export function createJamServer({
     close: () => new Promise((resolve, reject) => {
       closing = true;
       clearInterval(heartbeat);
+      for (const batch of metadataBatches.values()) clearTimeout(batch.timer);
+      metadataBatches.clear();
       store.close();
       for (const socket of wss.clients) socket.terminate();
       wss.close(() => {
@@ -202,7 +238,7 @@ export function createJamServer({
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const app = createJamServer();
+  const app = createJamServer({ lookupTrackMetadata: createSoundCloudMetadataResolver() });
   app.listen().then((address) => {
     console.log(`sc jams is listening at http://${address.address.includes(':') ? `[${address.address}]` : address.address}:${address.port}`);
   }).catch((error) => { console.error(error.message); process.exitCode = 1; });

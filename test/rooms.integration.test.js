@@ -985,3 +985,94 @@ test('a room with no remaining listeners starts its inactivity window at disconn
   timestamp += 60_001;
   assert.equal((await fetch(`${origin}/api/rooms/${roomId}`)).status, 404);
 });
+
+test('queued ID tracks gain titles before playback and keep their timeline and attribution after a host change', async (t) => {
+  let timestamp = 10_000;
+  const pending = new Map(), calls = [];
+  const { app, roomId, host, connect } = await fixture(t, {
+    now: () => timestamp,
+    lookupTrackMetadata: (url) => {
+      calls.push(url);
+      return new Promise((resolve) => pending.set(url, resolve));
+    },
+  });
+  const guest = connect({ name: 'Playlist friend' });
+  await guest.join(roomId);
+  const observer = connect({ name: 'Listening friend' });
+  await observer.join(roomId);
+  host.send({ type: 'add', url: TRACK_A });
+  await guest.state((room) => room.queue.length === 1);
+  const tracks = Array.from({ length: 6 }, (_, index) => ({ url: `https://api.soundcloud.com/tracks/${2000000 + index}`, title: `Playlist track ${index + 1}` }));
+  guest.send({ type: 'add_many', tracks });
+  const queued = await guest.state((room) => room.queue.length === 7);
+  assert.equal(pending.size, 6);
+  assert.equal(calls.includes(TRACK_A), false);
+  const playback = { ...queued.room.playback };
+  const ids = queued.room.queue.map((track) => track.id);
+  const activity = app.rooms.get(roomId).lastMusicActivityAt;
+  host.close();
+  const handedOff = await guest.state((room) => room.hostId === guest.identity.clientId);
+  timestamp += 5000;
+  for (const [index, track] of tracks.entries()) pending.get(track.url)({
+    title: `Resolved song ${index + 1}`, artist: 'Resolved artist',
+    addedBy: 'forged', addedByName: 'Wrong person', positionMs: 99000,
+  });
+  const [hydrated, observed] = await Promise.all([
+    guest.state((room) => room.queue[6]?.title === 'Resolved song 6'),
+    observer.state((room) => room.queue[6]?.title === 'Resolved song 6'),
+  ]);
+  assert.deepEqual(observed.room.queue, hydrated.room.queue);
+  assert.equal(hydrated.room.revision, handedOff.room.revision + 1, 'one batch broadcasts all six resolved names');
+  assert.deepEqual(hydrated.room.queue.map((track) => track.id), ids);
+  assert.deepEqual(hydrated.room.playback, playback);
+  assert.equal(hydrated.room.currentTrackId, queued.room.currentTrackId, 'pending songs were never selected to obtain titles');
+  assert.equal(app.rooms.get(roomId).lastMusicActivityAt, activity);
+  assert.ok(hydrated.room.queue.slice(1).every((track) => track.addedBy === guest.identity.clientId && track.addedByName === 'Playlist friend'));
+  assert.ok(hydrated.room.queue.slice(1).every((track) => track.artist === 'Resolved artist'));
+  assert.equal(calls.length, 6, 'metadata broadcasts do not repeat lookup requests');
+});
+
+test('metadata failures stay local and late results cannot restore removed tracks or extend inactive rooms', async (t) => {
+  let timestamp = 10_000;
+  const pending = new Map();
+  const { app, roomId, host } = await fixture(t, {
+    now: () => timestamp,
+    lookupTrackMetadata: (url) => new Promise((resolve, reject) => pending.set(url, { resolve, reject })),
+  });
+  const urls = [2000000, 2000001, 2000002].map((id) => `https://api.soundcloud.com/tracks/${id}`);
+  host.send({ type: 'add_many', tracks: urls.map((url) => ({ url })) });
+  const queued = await host.state((room) => room.queue.length === 3);
+  const internal = app.rooms.get(roomId);
+  host.send({ type: 'control', action: 'remove', trackId: queued.room.queue[2].id });
+  const removed = await host.state((room) => room.queue.length === 2);
+  pending.get(urls[1]).reject(new Error('Provider unavailable'));
+  pending.get(urls[2]).resolve({ title: 'Removed song', artist: 'Artist' });
+  await delay(300);
+  assert.equal(internal.revision, removed.room.revision);
+  assert.equal(internal.queue.length, 2);
+  assert.equal(host.inbox.some((message) => message.type === 'error'), false);
+  host.send({ type: 'control', action: 'pause' });
+  const paused = await host.state((room) => !room.playback.playing);
+  timestamp += 30 * 60_000 + 1;
+  pending.get(urls[0]).resolve({ title: 'Too late', artist: 'Artist' });
+  await host.waitFor((message) => message.type === 'room_closed');
+  assert.equal(app.rooms.has(roomId), false);
+  assert.equal(internal.revision, paused.room.revision, 'late metadata does not revise an expired room');
+  assert.notEqual(internal.queue[0].title, 'Too late');
+});
+
+test('metadata lookups finishing during shutdown cannot update room state', async (t) => {
+  let resolveLookup;
+  const { app, roomId, host } = await fixture(t, {
+    lookupTrackMetadata: () => new Promise((resolve) => { resolveLookup = resolve; }),
+  });
+  host.send({ type: 'add', url: 'https://api.soundcloud.com/tracks/1803239802' });
+  const queued = await host.state((room) => room.queue.length === 1);
+  const internal = app.rooms.get(roomId);
+  await app.close();
+  resolveLookup({ title: 'After shutdown', artist: 'Artist' });
+  await delay(300);
+  assert.equal(app.rooms.size, 0);
+  assert.equal(internal.revision, queued.room.revision);
+  assert.notEqual(internal.queue[0].title, 'After shutdown');
+});

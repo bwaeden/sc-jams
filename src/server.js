@@ -28,7 +28,7 @@ export function createJamServer({
   const creationLimits = new Map();
   let closing = false;
   let publicRoot;
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024, perMessageDeflate: false });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024, perMessageDeflate: false });
 
   function send(socket, message) {
     if (socket.readyState !== WebSocket.OPEN) return;
@@ -199,7 +199,7 @@ export function createJamServer({
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const app = createJamServer();
   app.listen().then((address) => {
-    console.log(`Sidecar is listening at http://${address.address.includes(':') ? `[${address.address}]` : address.address}:${address.port}`);
+    console.log(`sc jams is listening at http://${address.address.includes(':') ? `[${address.address}]` : address.address}:${address.port}`);
   }).catch((error) => { console.error(error.message); process.exitCode = 1; });
   let stopping = false;
   const stop = () => {

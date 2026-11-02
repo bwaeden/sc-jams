@@ -1,13 +1,13 @@
 const $ = (id) => document.getElementById(id);
 const storage = {
-  get(key) { try { return localStorage.getItem(`sidecar:${key}`); } catch { return null; } },
-  set(key, value) { try { localStorage.setItem(`sidecar:${key}`, value); } catch {} },
+  get(key) { try { return localStorage.getItem(`sc-jams:${key}`) ?? localStorage.getItem(`sidecar:${key}`); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(`sc-jams:${key}`, value); } catch {} },
 };
 // Session identity keeps separate tabs independent while allowing a refresh to reconnect.
 function sessionValue(key) {
   try {
-    let value = sessionStorage.getItem(`sidecar:${key}`);
-    if (!value) sessionStorage.setItem(`sidecar:${key}`, value = crypto.randomUUID());
+    let value = sessionStorage.getItem(`sc-jams:${key}`);
+    if (!value) sessionStorage.setItem(`sc-jams:${key}`, value = crypto.randomUUID());
     return value;
   } catch { return crypto.randomUUID(); }
 }
@@ -25,6 +25,12 @@ let pendingForce = false, syncAttempt = 0;
 let lastPosition = 0, lastPositionAt = 0, knownDuration = 0, lastWidgetPlaying = false;
 let lastHostReport = 0, playerUnavailable = false;
 let toastTimer, firstTrack;
+let volume = Number(storage.get('volume') ?? 70);
+if (!Number.isFinite(volume)) volume = 70;
+volume = Math.max(0, Math.min(100, volume));
+let unmutedVolume = volume || 70;
+let playlistWidget, playlistGeneration = 0, playlistTracks = [], playlistTimer;
+let waitingLocally = false;
 const isHost = () => room?.hostId === clientId;
 const serverNow = () => Date.now() + clockOffset;
 const currentTrack = () => room?.queue.find((track) => track.id === room.currentTrackId);
@@ -68,21 +74,135 @@ function canonicalTrack(value) {
   if (url.searchParams.has('secret_token') || !parts.every((part) => /^[a-zA-Z0-9_-]+$/.test(part))) throw new Error('This prototype supports public SoundCloud tracks. Choose a public track link.');
   return `https://soundcloud.com/${parts.join('/')}`;
 }
+function musicLink(value) {
+  let url;
+  try { url = new URL(value.trim()); } catch { throw new Error('Paste a full SoundCloud track or playlist link.'); }
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (url.protocol === 'https:' && ['soundcloud.com', 'www.soundcloud.com'].includes(url.hostname) && !url.port && !url.username && !url.password && parts.length === 3 && parts[1] === 'sets' && parts.every((part) => /^[a-zA-Z0-9_-]+$/.test(part)) && !url.searchParams.has('secret_token')) {
+    return { playlist: true, url: `https://soundcloud.com/${parts.join('/')}` };
+  }
+  return { playlist: false, url: canonicalTrack(value) };
+}
+function applyVolume() {
+  $('volume').value = volume;
+  $('volume-value').textContent = `${volume}%`;
+  $('mute-button').innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z"/>${volume === 0 ? '<path d="m16 9 5 6m0-6-5 6"/>' : '<path d="M15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/>'}</svg>`;
+  $('mute-button').setAttribute('aria-label', volume === 0 ? 'Unmute your audio' : 'Mute your audio');
+  $('mute-button').setAttribute('aria-pressed', String(volume === 0));
+  if (widget && playerReady) widget.setVolume(volume);
+  storage.set('volume', String(volume));
+}
+function applyTheme(theme) {
+  document.documentElement?.setAttribute('data-theme', theme);
+  $('theme-toggle').textContent = theme === 'dark' ? '☀' : '◐';
+  $('theme-toggle').setAttribute('aria-label', theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+  $('theme-toggle').setAttribute('aria-pressed', String(theme === 'dark'));
+  storage.set('theme', theme);
+}
+async function loadLinks() {
+  $('links-toggle').hidden = true;
+  try {
+    const response = await fetch('/links.json');
+    if (!response.ok) return;
+    const configured = await response.json();
+    if (!Array.isArray(configured)) return;
+    const links = [];
+    for (const link of configured.slice(0, 8)) {
+      try {
+        const url = new URL(link.url);
+        if (url.protocol !== 'https:' || url.username || url.password || typeof link.label !== 'string' || !link.label.trim()) continue;
+        const anchor = document.createElement('a');
+        anchor.textContent = link.label.trim().slice(0, 40);
+        anchor.href = url.href;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
+        links.push(anchor);
+      } catch { /* Ignore incomplete optional links. */ }
+    }
+    if (!links.length) return;
+    $('links-panel').replaceChildren(...links);
+    $('links-toggle').hidden = false;
+  } catch { /* Optional social links never block creating a room. */ }
+}
+function closePlaylist() {
+  playlistGeneration++;
+  clearTimeout(playlistTimer);
+  playlistWidget?.pause();
+  playlistWidget = null;
+  playlistTracks = [];
+  $('playlist-preview').replaceChildren();
+  $('playlist-import').hidden = true;
+}
+function previewPlaylist(url) {
+  closePlaylist();
+  const generation = playlistGeneration;
+  $('playlist-import').hidden = false;
+  $('import-status').textContent = 'Loading playlist…';
+  $('import-playlist-button').disabled = true;
+  if (!window.SC?.Widget) { errorAt('queue-error', 'SoundCloud is still loading. Try again in a moment.'); return; }
+  const iframe = document.createElement('iframe');
+  iframe.title = 'SoundCloud playlist import preview';
+  iframe.height = '166';
+  iframe.scrolling = 'no';
+  iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(url)}&auto_play=false&color=%23f5613c&show_comments=false&visual=false`;
+  $('playlist-preview').replaceChildren(iframe);
+  const instance = window.SC.Widget(iframe);
+  playlistWidget = instance;
+  instance.bind(window.SC.Widget.Events.READY, () => {
+    if (generation !== playlistGeneration) return;
+    instance.setVolume(0);
+    instance.getSounds((sounds) => {
+      if (generation !== playlistGeneration) return;
+      clearTimeout(playlistTimer);
+      const seen = new Set(room?.queue.map((track) => track.url) || []);
+      const available = Math.max(0, 100 - (room?.queue.length || 0));
+      playlistTracks = [];
+      for (const sound of Array.isArray(sounds) ? sounds : []) {
+        try {
+          const trackUrl = canonicalTrack(sound.permalink_url || '');
+          if (seen.has(trackUrl) || sound.access === 'blocked') continue;
+          seen.add(trackUrl);
+          if (playlistTracks.length >= available) break;
+          playlistTracks.push({ url: trackUrl, title: String(sound.title || '').slice(0, 200), artist: String(sound.user?.username || '').slice(0, 100), duration: Math.min(86400000, Math.max(0, Number(sound.duration) || 0)) });
+        } catch { /* Only public canonical track URLs can enter the shared queue. */ }
+      }
+      $('import-status').textContent = playlistTracks.length ? `${playlistTracks.length} tracks ready · queue limit 100` : 'No new playable tracks to add, or the queue is full.';
+      $('import-playlist-button').textContent = `Add ${playlistTracks.length} tracks`;
+      $('import-playlist-button').disabled = !playlistTracks.length || !connected;
+    });
+  });
+  instance.bind(window.SC.Widget.Events.ERROR, () => {
+    if (generation !== playlistGeneration) return;
+    clearTimeout(playlistTimer);
+    $('import-status').textContent = 'This playlist is unavailable. Try a public, embeddable playlist.';
+  });
+  playlistTimer = setTimeout(() => {
+    if (generation === playlistGeneration) $('import-status').textContent = 'SoundCloud did not load this playlist. Check your connection or try another link.';
+  }, 18000);
+}
 function roomCode(value) {
   let input = value.trim();
   try { const url = new URL(input); input = url.pathname.split('/').filter(Boolean).at(-1); } catch {}
   if (!/^[A-Za-z0-9_-]{6,64}$/.test(input)) throw new Error('Paste a room invite link or a valid room code.');
   return input;
 }
+function showJoin(id) {
+  roomId = id;
+  history.replaceState(null, '', `/room/${encodeURIComponent(id)}`);
+  $('landing').hidden = true;
+  $('room-view').hidden = true;
+  $('join-overlay').hidden = false;
+  $('join-name').focus();
+}
 function openRoom(id, name) {
   roomId = id;
-  displayName = name.trim().slice(0, 24);
+  displayName = name.trim().slice(0, 24) || `Listener ${clientId.slice(0, 4)}`;
   storage.set('name', displayName);
   history.replaceState(null, '', `/room/${encodeURIComponent(id)}`);
   $('landing').hidden = true;
   $('join-overlay').hidden = true;
   $('room-view').hidden = false;
-  document.title = 'Your room — Sidecar';
+  document.title = 'sc jams';
   stopped = false;
   connect();
 }
@@ -143,7 +263,11 @@ function connect() {
       setTimeout(ping, 750);
       pingTimer = setInterval(ping, 10000);
       joinedOnce = true;
-      if (firstTrack) { send({ type: 'add', url: firstTrack }); firstTrack = null; }
+      if (firstTrack) {
+        if (firstTrack.playlist) previewPlaylist(firstTrack.url);
+        else send({ type: 'add', url: firstTrack.url });
+        firstTrack = null;
+      }
     }
     if (previousHost && previousHost !== room.hostId) toast(isHost() ? 'You’re hosting now.' : 'The room has a new host.');
     const track = currentTrack();
@@ -186,7 +310,10 @@ function el(tag, className, text) {
   return node;
 }
 function renderRoom() {
-  $('room-subtitle').textContent = `ROOM ${room.id} · ${isHost() ? 'You’re hosting this one.' : 'Settle in. You’re listening with friends.'}`;
+  $('room-subtitle').textContent = isHost() ? 'You’re hosting' : 'Listening together';
+  const waiter = room.hold?.waiters?.find((member) => member.memberId === clientId);
+  if (!room.hold || waiter?.ready) waitingLocally = false;
+  else if (waiter || room.hold.memberId === clientId) waitingLocally = true;
   $('people-count').textContent = room.members.filter((member) => member.connected).length;
   $('people').replaceChildren(...room.members.map((member, index) => {
     const item = el('li', `person${member.connected ? '' : ' away'}`);
@@ -240,13 +367,18 @@ function renderControls() {
   $('add-button').disabled = !connected;
   $('play-icon').textContent = room?.playback.playing ? 'Ⅱ' : '▶';
   $('play-button').setAttribute('aria-label', room?.playback.playing ? 'Pause shared track' : 'Play shared track');
-  $('playback-label').textContent = track ? room.playback.playing ? 'LISTENING TOGETHER' : 'TAKE YOUR TIME' : 'ROOM IS QUIET';
-  $('role-hint').textContent = isHost() ? 'You control playback. Everyone can add tracks.' : 'Following the host. Your volume stays yours.';
+  $('playback-label').textContent = track ? room.playback.playing ? 'Playing' : 'Paused' : '';
+  const waiting = room?.hold?.waiters?.filter((member) => !member.ready).map((member) => member.name) || (room?.hold ? [room.hold.name] : []);
+  $('role-hint').textContent = room?.hold ? waiting.length ? `Waiting for ${waiting.join(', ')}` : 'Everyone is ready. Host can resume.' : isHost() ? 'You control playback.' : 'Following the host.';
+  $('wait-button').textContent = waitingLocally ? 'I’m ready' : 'Wait for me';
+  $('wait-button').disabled = !track || !connected;
+  $('volume').disabled = false;
   $('resync-button').hidden = !track;
+  $('resync-button').disabled = waitingLocally;
   $('enable-audio').hidden = !track || audioEnabled;
 }
 function suppressEvents() { ignoreEventsUntil = performance.now() + 1100; }
-function eventsAllowed() { return isHost() && connected && playerReady && !syncing && performance.now() > ignoreEventsUntil; }
+function eventsAllowed() { return isHost() && connected && playerReady && !waitingLocally && !syncing && performance.now() > ignoreEventsUntil; }
 function clearPlayer() {
   loadGeneration++;
   syncing = false;
@@ -303,6 +435,7 @@ function loadTrack(track) {
     instance.bind(events.READY, () => {
       if (!valid()) return;
       playerReady = true;
+      applyVolume();
       instance.getDuration((duration) => { if (valid()) { knownDuration = duration || 0; renderControls(); } });
       instance.getCurrentSound((sound) => {
         if (!valid() || !sound) return;
@@ -345,7 +478,7 @@ function loadTrack(track) {
       else if (!isHost() && performance.now() > ignoreEventsUntil) setTimeout(() => reconcile(true), 100);
     });
     instance.bind(events.FINISH, () => {
-      if (valid() && isHost() && connected && room?.playback.playing) send({ type: 'control', action: 'skip' });
+      if (valid() && isHost() && connected && !waitingLocally && room?.playback.playing) send({ type: 'control', action: 'skip' });
     });
     instance.bind(events.ERROR, () => {
       if (!valid()) return;
@@ -363,12 +496,15 @@ function loadTrack(track) {
   }, 18000);
 }
 function reconcile(force = false) {
+  // The requester finishes their ad locally. Widget events cannot identify ads,
+  // so no seek/pause/play commands are sent until they explicitly mark ready.
+  if (waitingLocally) { setSync('Finish your ad, then choose “I’m ready”', true); return; }
   if (!widget || !playerReady || !connected || !currentTrack() || playerUnavailable) return;
   if (syncing) { pendingForce ||= force; return; }
   const instance = widget, generation = loadGeneration, attempt = ++syncAttempt;
   let active = true;
   syncing = true;
-  const valid = () => active && connected && generation === loadGeneration && instance === widget && attempt === syncAttempt;
+  const valid = () => active && connected && !waitingLocally && generation === loadGeneration && instance === widget && attempt === syncAttempt;
   const finish = () => {
     if (!valid()) return;
     active = false;
@@ -416,7 +552,7 @@ setInterval(() => reconcile(), 2500);
 // Server time remains authoritative. Host reports are deliberately infrequent and
 // only correct real buffering stalls, rather than moving the room every frame.
 heartbeatTimer = setInterval(() => {
-  if (!isHost() || !connected || !playerReady || !audioEnabled || syncing || playerUnavailable || !room.playback.playing || !lastWidgetPlaying || performance.now() < ignoreEventsUntil) return;
+  if (!isHost() || !connected || !playerReady || !audioEnabled || waitingLocally || syncing || playerUnavailable || !room.playback.playing || !lastWidgetPlaying || performance.now() < ignoreEventsUntil) return;
   const instance = widget, trackId = loadedTrackId, baseRevision = room.revision;
   instance.getPosition((position) => {
     if (instance !== widget || trackId !== room?.currentTrackId || baseRevision !== room?.revision) return;
@@ -433,7 +569,7 @@ $('create-form').addEventListener('submit', async (event) => {
   const button = $('create-button');
   button.disabled = true;
   try {
-    firstTrack = $('first-track').value.trim() ? canonicalTrack($('first-track').value) : null;
+    firstTrack = $('first-track').value.trim() ? musicLink($('first-track').value) : null;
     const response = await fetch('/api/rooms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     const result = await response.json();
     if (!response.ok) throw new Error(result.message || result.error || 'Couldn’t create the room. Try again.');
@@ -445,7 +581,7 @@ $('create-form').addEventListener('submit', async (event) => {
 $('show-join').addEventListener('click', () => { $('join-code-form').hidden = !$('join-code-form').hidden; if (!$('join-code-form').hidden) $('room-link').focus(); });
 $('join-code-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  try { location.href = `/room/${encodeURIComponent(roomCode($('room-link').value))}`; }
+  try { showJoin(roomCode($('room-link').value)); }
   catch (error) { errorAt('create-error', error.message); }
 });
 $('join-form').addEventListener('submit', async (event) => {
@@ -462,14 +598,16 @@ $('add-form').addEventListener('submit', (event) => {
   event.preventDefault();
   errorAt('queue-error');
   try {
-    const url = canonicalTrack($('track-url').value);
-    if (!send({ type: 'add', url })) throw new Error('Wait for the room to reconnect, then try again.');
+    const link = musicLink($('track-url').value);
+    if (!connected) throw new Error('Wait for the room to reconnect, then try again.');
+    if (link.playlist) previewPlaylist(link.url);
+    else if (!send({ type: 'add', url: link.url })) throw new Error('Wait for the room to reconnect, then try again.');
     $('track-url').value = '';
   } catch (error) { errorAt('queue-error', error.message); }
 });
 $('invite-button').addEventListener('click', async () => {
   const invite = `${location.origin}/room/${roomId}`;
-  try { await navigator.clipboard.writeText(invite); toast('Invite copied. Send it to someone with good taste.'); }
+  try { await navigator.clipboard.writeText(invite); toast('Invite copied.'); }
   catch { window.prompt('Copy this room link:', invite); }
 });
 $('play-button').addEventListener('click', () => {
@@ -495,14 +633,73 @@ $('enable-audio').addEventListener('click', () => {
   reconcile(true);
 });
 $('resync-button').addEventListener('click', () => { lastCorrection = 0; reconcile(true); toast('Catching up to the room.'); });
+$('volume').addEventListener('input', () => {
+  volume = Math.max(0, Math.min(100, Number($('volume').value) || 0));
+  if (volume > 0) unmutedVolume = volume;
+  applyVolume();
+});
+$('mute-button').addEventListener('click', () => {
+  if (volume > 0) { unmutedVolume = volume; volume = 0; }
+  else volume = unmutedVolume;
+  applyVolume();
+});
+$('theme-toggle').addEventListener('click', () => applyTheme(storage.get('theme') === 'dark' ? 'light' : 'dark'));
+$('wait-button').addEventListener('click', () => {
+  if (!connected || !currentTrack()) return;
+  if (waitingLocally) {
+    waitingLocally = false;
+    send({ type: 'hold_ready' });
+    reconcile(true);
+  } else {
+    waitingLocally = true;
+    syncing = false;
+    pendingForce = false;
+    syncAttempt++;
+    send({ type: 'hold' });
+    setSync('Finish your ad, then choose “I’m ready”', true);
+  }
+  renderControls();
+});
+$('import-playlist-button').addEventListener('click', () => {
+  if (!playlistTracks.length) return;
+  if (send({ type: 'add_many', tracks: playlistTracks })) { closePlaylist(); toast('Playlist sent to the queue.'); }
+});
+$('cancel-playlist-button').addEventListener('click', closePlaylist);
+$('links-toggle').addEventListener('click', () => {
+  $('links-panel').hidden = !$('links-panel').hidden;
+  $('links-toggle').setAttribute('aria-expanded', String(!$('links-panel').hidden));
+});
+function leaveRoom() {
+  stopped = true;
+  clearTimeout(reconnectTimer);
+  clearInterval(pingTimer);
+  const previous = socket;
+  socket = null;
+  previous?.close();
+  connected = false;
+  waitingLocally = false;
+  closePlaylist();
+  clearPlayer();
+  room = null;
+  roomId = null;
+  lastRevision = -1;
+  joinedOnce = false;
+  clockSamples = [];
+  history.replaceState(null, '', '/');
+  $('room-view').hidden = true;
+  $('join-overlay').hidden = true;
+  $('landing').hidden = false;
+  document.title = 'sc jams';
+}
+$('leave-room').addEventListener('click', leaveRoom);
+$('join-back').addEventListener('click', leaveRoom);
+applyVolume();
+applyTheme(storage.get('theme') || (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+loadLinks();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { send({ type: 'ping', sentAt: Date.now() }); reconcile(true); } });
 window.addEventListener('beforeunload', () => { stopped = true; clearInterval(heartbeatTimer); socket?.close(); });
 
 const path = location.pathname.match(/^\/room\/([A-Za-z0-9_-]{6,64})\/?$/);
 if (path) {
-  roomId = path[1];
-  $('landing').hidden = true;
-  $('room-view').hidden = false;
-  $('join-overlay').hidden = false;
-  $('join-name').focus();
+  showJoin(path[1]);
 }

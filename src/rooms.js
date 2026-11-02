@@ -23,6 +23,29 @@ function position(value) {
   return Math.round(value);
 }
 
+function metadata(value) {
+  const result = {};
+  const title = text(value.title, 200);
+  const artist = text(value.artist, 100);
+  if (title) result.title = title;
+  if (artist) result.artist = artist;
+  if (value.duration !== undefined) result.duration = position(value.duration);
+  if (typeof value.artwork === 'string' && value.artwork.length < 2048) {
+    try {
+      const artwork = new URL(value.artwork);
+      if (artwork.protocol === 'https:' && !artwork.username && !artwork.password && !artwork.port && (artwork.hostname === 'sndcdn.com' || artwork.hostname.endsWith('.sndcdn.com'))) result.artwork = artwork.href;
+    } catch { /* Artwork is optional; ignore invalid values. */ }
+  }
+  return result;
+}
+
+function newTrack(value, member) {
+  requireValue(value && typeof value === 'object' && !Array.isArray(value), 'invalid_track', 'Each playlist item must be a SoundCloud track.');
+  const url = normalizeTrackUrl(value.url);
+  const parts = new URL(url).pathname.split('/').filter(Boolean);
+  return { id: randomUUID(), url, title: parts[1].replace(/-/g, ' '), artist: parts[0], artwork: null, duration: 0, addedBy: member.id, ...metadata(value) };
+}
+
 export function getPosition(room, at = Date.now()) {
   const elapsed = room.playback.playing ? Math.max(0, at - room.playback.updatedAt) : 0;
   const duration = room.queue.find((track) => track.id === room.currentTrackId)?.duration;
@@ -84,7 +107,7 @@ export function createRoomStore({
     do { id = randomBytes(9).toString('base64url'); } while (rooms.has(id));
     const timestamp = now();
     const room = { id, revision: 0, hostId: null, members: new Map(), queue: [], currentTrackId: null,
-      playback: { playing: false, positionMs: 0, updatedAt: timestamp }, createdAt: timestamp, lastActive: timestamp };
+      playback: { playing: false, positionMs: 0, updatedAt: timestamp }, hold: null, createdAt: timestamp, lastActive: timestamp };
     rooms.set(id, room);
     return room;
   }
@@ -99,7 +122,7 @@ export function createRoomStore({
     return { id: room.id, revision: room.revision, hostId: room.hostId,
       members: [...room.members.values()].map(({ id, name, connected }) => ({ id, name, connected })),
       queue: room.queue.map((track) => ({ ...track })), currentTrackId: room.currentTrackId,
-      playback: { ...room.playback } };
+      playback: { ...room.playback }, hold: room.hold ? { ...room.hold, waiters: room.hold.waiters.map((waiter) => ({ ...waiter })) } : null };
   }
 
   function join(roomId, { clientId, token, name }, socket) {
@@ -170,27 +193,43 @@ export function createRoomStore({
     requireValue(message && typeof message === 'object' && !Array.isArray(message), 'invalid_message', 'Send a valid room message.');
     if (message.type === 'add') {
       requireValue(room.queue.length < 100, 'queue_full', 'The queue is full (100 tracks).');
-      const url = normalizeTrackUrl(message.url);
-      requireValue(!room.queue.some((track) => track.url === url), 'duplicate_track', 'That track is already in the queue.');
-      const parts = new URL(url).pathname.split('/').filter(Boolean);
-      const track = { id: randomUUID(), url, title: parts[1].replace(/-/g, ' '), artist: parts[0], artwork: null, duration: 0, addedBy: member.id };
+      const track = newTrack({ url: message.url }, member);
+      requireValue(!room.queue.some((item) => item.url === track.url), 'duplicate_track', 'That track is already in the queue.');
       room.queue.push(track);
       if (!room.currentTrackId) select(room, track.id, false);
+    } else if (message.type === 'add_many') {
+      requireValue(Array.isArray(message.tracks) && message.tracks.length > 0 && message.tracks.length <= 100, 'invalid_batch', 'Import between 1 and 100 tracks at a time.');
+      // Validate every item before changing the queue, including duplicated items.
+      const prepared = message.tracks.map((item) => newTrack(item, member));
+      const seen = new Set(room.queue.map((track) => track.url));
+      const additions = prepared.filter((track) => {
+        if (seen.has(track.url)) return false;
+        seen.add(track.url);
+        return true;
+      });
+      requireValue(additions.length > 0, 'duplicate_track', 'These tracks are already in the queue.');
+      requireValue(room.queue.length + additions.length <= 100, 'queue_full', 'The queue holds 100 tracks. Remove some tracks before importing this playlist.');
+      room.queue.push(...additions);
+      if (!room.currentTrackId) select(room, additions[0].id, false);
+    } else if (message.type === 'hold') {
+      requireValue(room.currentTrackId, 'empty_queue', 'Add a track before asking the room to wait.');
+      const at = now();
+      room.playback = { playing: false, positionMs: getPosition(room, at), updatedAt: at };
+      room.hold ??= { memberId: member.id, name: member.name, reason: 'manual', at, waiters: [] };
+      const waiter = room.hold.waiters.find((item) => item.memberId === member.id);
+      if (waiter) { waiter.name = member.name; waiter.ready = false; }
+      else room.hold.waiters.push({ memberId: member.id, name: member.name, ready: false });
+    } else if (message.type === 'hold_ready') {
+      const waiter = room.hold?.waiters.find((item) => item.memberId === member.id);
+      requireValue(waiter, 'not_waiting', 'You have not asked this room to wait.');
+      if (waiter.ready) return;
+      // Readiness is personal; it never resumes the room or changes another listener.
+      waiter.ready = true;
     } else if (message.type === 'metadata') {
       requireHost(room, member);
       const track = room.queue.find((item) => item.id === message.trackId);
       requireValue(track, 'track_not_found', 'This track is no longer in the queue.');
-      const title = text(message.title, 200);
-      const artist = text(message.artist, 100);
-      if (title) track.title = title;
-      if (artist) track.artist = artist;
-      if (message.duration !== undefined) track.duration = position(message.duration);
-      if (typeof message.artwork === 'string' && message.artwork.length < 2048) {
-        try {
-          const artwork = new URL(message.artwork);
-          if (artwork.protocol === 'https:' && !artwork.username && !artwork.password && (artwork.hostname === 'sndcdn.com' || artwork.hostname.endsWith('.sndcdn.com'))) track.artwork = artwork.href;
-        } catch { /* Artwork is optional; ignore invalid values. */ }
-      }
+      Object.assign(track, metadata(message));
     } else if (message.type === 'position') {
       requireHost(room, member);
       requireValue(room.currentTrackId && message.trackId === room.currentTrackId, 'stale_track', 'Playback changed. Sync to the current track.');
@@ -233,6 +272,7 @@ export function createRoomStore({
         requireValue(['play', 'pause', 'seek'].includes(message.action), 'invalid_action', 'Choose a valid playback action.');
         room.playback = { playing: message.action === 'play' ? true : message.action === 'pause' ? false : room.playback.playing,
           positionMs: Math.min(nextPosition, current.duration || MAX_DURATION), updatedAt: now() };
+        if (message.action === 'play') room.hold = null;
       }
     } else throw new RoomError('unknown_message', 'This room message is not supported.');
     changed(room);

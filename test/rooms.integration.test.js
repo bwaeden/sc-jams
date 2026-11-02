@@ -106,6 +106,129 @@ test('a friend can add a track and both clients receive the same queue revision'
   assert.ok(!JSON.stringify(guestState).includes(guest.identity.token));
 });
 
+test('a playlist import is atomic when one of its tracks is invalid', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  host.send({ type: 'add_many', tracks: [{ url: TRACK_A }, { url: 'https://evil.example/artist/song' }] });
+  const error = await host.waitFor((message) => message.type === 'error');
+  assert.equal(error.code, 'invalid_url');
+  const guest = connect();
+  const joined = await guest.join(roomId);
+  assert.deepEqual(joined.room.queue, []);
+  assert.equal(joined.room.currentTrackId, null);
+  host.send({ type: 'add_many', tracks: [{ url: TRACK_A }, { url: TRACK_B, duration: -1 }] });
+  assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'invalid_position');
+  host.send({ type: 'add', url: TRACK_B });
+  const added = await guest.state((room) => room.queue.length === 1);
+  assert.equal(added.room.queue[0].url, TRACK_B);
+});
+
+test('a friend can import a playlist with duplicate links skipped and metadata sanitized', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  host.send({ type: 'add', url: TRACK_A });
+  await host.state((room) => room.queue.length === 1);
+  const guest = connect({ name: 'Playlist friend' });
+  await guest.join(roomId);
+  guest.send({ type: 'add_many', tracks: [
+    { url: TRACK_A },
+    { url: TRACK_B + '?utm_source=share', title: '\u0000  Second track  ', artist: 'A'.repeat(130), duration: 123456, artwork: 'https://evil.example/image.jpg' },
+    { url: TRACK_B, title: 'Duplicated title' },
+  ] });
+  const [hostState, guestState] = await Promise.all([
+    host.state((room) => room.queue.length === 2),
+    guest.state((room) => room.queue.length === 2),
+  ]);
+  assert.deepEqual(hostState.room.queue, guestState.room.queue);
+  const imported = hostState.room.queue[1];
+  assert.equal(imported.url, TRACK_B);
+  assert.equal(imported.title, 'Second track');
+  assert.equal(imported.artist.length, 100);
+  assert.equal(imported.duration, 123456);
+  assert.equal(imported.artwork, null);
+  assert.equal(imported.addedBy, guest.identity.clientId);
+});
+
+test('playlist imports enforce the queue cap without partially appending tracks', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  const tracks = Array.from({ length: 99 }, (_, index) => ({ url: `https://soundcloud.com/artist/track-${index}` }));
+  host.send({ type: 'add_many', tracks });
+  await host.state((room) => room.queue.length === 99);
+  host.send({ type: 'add_many', tracks: [{ url: TRACK_A }, { url: TRACK_B }] });
+  assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'queue_full');
+  const guest = connect();
+  const joined = await guest.join(roomId);
+  assert.equal(joined.room.queue.length, 99);
+  assert.ok(joined.room.queue.every((track) => track.url !== TRACK_A && track.url !== TRACK_B));
+  host.send({ type: 'add_many', tracks: [...tracks.slice(0, 1), { url: TRACK_A }] });
+  const full = await guest.state((room) => room.queue.length === 100);
+  assert.equal(full.room.queue.at(-1).url, TRACK_A);
+});
+
+test('a friend can ask the whole room to wait, and only the host can resume', async (t) => {
+  let timestamp = 100000;
+  const { roomId, host, connect } = await fixture(t, { now: () => timestamp });
+  host.send({ type: 'add', url: TRACK_A });
+  await host.state((room) => room.queue.length === 1);
+  const guest = connect({ name: 'Ad listener' });
+  await guest.join(roomId);
+  host.send({ type: 'control', action: 'play', positionMs: 15000 });
+  await guest.state((room) => room.playback.playing);
+  timestamp += 2000;
+  // A guest cannot substitute their own playback offset or claim automatic ad detection.
+  guest.send({ type: 'hold', positionMs: 1, reason: 'advertisement' });
+  const [hostState, guestState] = await Promise.all([
+    host.state((room) => room.hold !== null), guest.state((room) => room.hold !== null),
+  ]);
+  assert.deepEqual(hostState.room.playback, guestState.room.playback);
+  assert.equal(guestState.room.playback.playing, false);
+  assert.equal(guestState.room.playback.positionMs, 17000);
+  assert.deepEqual(guestState.room.hold, { memberId: guest.identity.clientId, name: 'Ad listener', reason: 'manual', at: timestamp,
+    waiters: [{ memberId: guest.identity.clientId, name: 'Ad listener', ready: false }] });
+  guest.send({ type: 'control', action: 'play' });
+  assert.equal((await guest.waitFor((message) => message.type === 'error')).code, 'host_only');
+  host.send({ type: 'control', action: 'seek', positionMs: 18000 });
+  const stillWaiting = await guest.state((room) => room.playback.positionMs === 18000);
+  assert.equal(stillWaiting.room.playback.playing, false);
+  assert.ok(stillWaiting.room.hold);
+  host.send({ type: 'control', action: 'play' });
+  const resumed = await guest.state((room) => room.playback.playing && room.hold === null);
+  assert.equal(resumed.room.playback.positionMs, 18000);
+});
+
+test('waiting listeners become ready independently without resuming the shared track', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  host.send({ type: 'add', url: TRACK_A });
+  await host.state((room) => room.queue.length === 1);
+  const first = connect({ name: 'First waiter' });
+  const second = connect({ name: 'Second waiter' });
+  const bystander = connect({ name: 'Already ready' });
+  await first.join(roomId);
+  await second.join(roomId);
+  await bystander.join(roomId);
+  host.send({ type: 'control', action: 'play', positionMs: 12000 });
+  await first.state((room) => room.playback.playing);
+  first.send({ type: 'hold' });
+  const original = await host.state((room) => room.hold?.waiters.length === 1);
+  second.send({ type: 'hold' });
+  const waiting = await host.state((room) => room.hold?.waiters.length === 2);
+  assert.equal(waiting.room.hold.memberId, first.identity.clientId);
+  assert.equal(waiting.room.hold.at, original.room.hold.at);
+  assert.ok(waiting.room.hold.waiters.every((item) => item.ready === false));
+  // The sender's authenticated identity controls readiness, not a supplied memberId.
+  bystander.send({ type: 'hold_ready', memberId: first.identity.clientId });
+  assert.equal((await bystander.waitFor((message) => message.type === 'error')).code, 'not_waiting');
+  first.send({ type: 'hold_ready', memberId: second.identity.clientId });
+  const oneReady = await host.state((room) => room.hold?.waiters.some((item) => item.memberId === first.identity.clientId && item.ready));
+  assert.equal(oneReady.room.hold.waiters.find((item) => item.memberId === second.identity.clientId).ready, false);
+  assert.equal(oneReady.room.playback.playing, false);
+  second.send({ type: 'hold_ready' });
+  const allReady = await host.state((room) => room.hold?.waiters.length === 2 && room.hold.waiters.every((item) => item.ready));
+  assert.equal(allReady.room.playback.playing, false);
+  first.send({ type: 'control', action: 'play' });
+  assert.equal((await first.waitFor((message) => message.type === 'error')).code, 'host_only');
+  host.send({ type: 'control', action: 'play' });
+  await second.state((room) => room.playback.playing && room.hold === null);
+});
+
 test('guests cannot play, seek, remove tracks, or publish host position', async (t) => {
   const { roomId, host, connect } = await fixture(t);
   host.send({ type: 'add', url: TRACK_A });

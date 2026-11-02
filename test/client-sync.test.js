@@ -9,7 +9,7 @@ const EVENTS = Object.fromEntries(['READY', 'PLAY_PROGRESS', 'PLAY', 'PAUSE', 'S
 
 // This deliberately leaves widget getters pending. SoundCloud's iframe API is
 // asynchronous, so track changes and server updates can arrive before a getter.
-function browser() {
+function browser({ saved = {} } = {}) {
   let timestamp = 1_800_000_000_000, monotonic = 10_000, timerId = 0;
   const intervals = [], timeouts = new Map(), elements = new Map(), widgets = [], sockets = [], messages = [];
   class Element {
@@ -31,14 +31,16 @@ function browser() {
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id);
   };
-  const storage = () => {
-    const values = new Map();
-    return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) };
+  const storage = (initial = {}) => {
+    const values = new Map(Object.entries(initial));
+    return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), snapshot: () => Object.fromEntries(values) };
   };
+  const localStorage = storage(saved);
+  const root = new Element('html');
   function Widget(iframe) {
     const callbacks = new Map();
     const instance = {
-      iframe, callbacks, pendingPositions: [], calls: [], paused: true,
+      iframe, callbacks, pendingPositions: [], pendingSounds: [], calls: [], paused: true, volume: 100,
       bind(event, callback) { callbacks.set(event, callback); },
       emit(event, payload = {}) { callbacks.get(event)?.(payload); },
       getPosition(callback) { this.pendingPositions.push(callback); },
@@ -50,6 +52,13 @@ function browser() {
       isPaused(callback) { callback(this.paused); },
       getDuration(callback) { callback(240000); },
       getCurrentSound(callback) { callback({ title: 'Test track', user: { username: 'Test artist' }, duration: 240000 }); },
+      getSounds(callback) { this.pendingSounds.push(callback); },
+      resolveSounds(sounds) {
+        const callback = this.pendingSounds.shift();
+        assert.ok(callback, 'the client must have requested playlist sounds');
+        callback(sounds);
+      },
+      setVolume(value) { this.volume = value; this.calls.push({ method: 'setVolume', volume: value }); },
       seekTo(position) { this.calls.push({ method: 'seekTo', position }); this.emit(EVENTS.SEEK, { currentPosition: position }); },
       play() { this.calls.push({ method: 'play' }); this.paused = false; this.emit(EVENTS.PLAY); },
       pause() { this.calls.push({ method: 'pause' }); this.paused = true; this.emit(EVENTS.PAUSE); },
@@ -74,9 +83,9 @@ function browser() {
     document: {
       getElementById: element, createElement: (tag) => new Element(tag),
       createTextNode: (text) => ({ textContent: text }), addEventListener() {},
-      activeElement: null, hidden: false,
+      activeElement: null, hidden: false, documentElement: root,
     },
-    localStorage: storage(), sessionStorage: storage(),
+    localStorage, sessionStorage: storage(),
     location: { protocol: 'http:', origin: 'http://localhost:3000', host: 'localhost:3000', pathname: '/' },
     history: { replaceState() {} },
     navigator: {},
@@ -89,7 +98,7 @@ function browser() {
   });
   vm.runInContext(source + `
     globalThis.__appTest = {
-      clientId, connect, loadTrack, clearPlayer, reconcile, targetPosition,
+      clientId, connect, loadTrack, clearPlayer, reconcile, targetPosition, previewPlaylist, closePlaylist,
       configure(next) {
         if ('room' in next) room = next.room;
         if ('connected' in next) connected = next.connected;
@@ -97,14 +106,19 @@ function browser() {
         if ('clockOffset' in next) clockOffset = next.clockOffset;
         if ('socket' in next) socket = next.socket;
       },
-      status() { return { syncing, loadedTrackId, loadGeneration, playerReady, ignoreEventsUntil }; }
+      status() { return { syncing, loadedTrackId, loadGeneration, playerReady, ignoreEventsUntil, volume, waitingLocally, playlistTracks }; }
     };
   `, context, { filename: 'app.js' });
   const app = context.__appTest;
   app.configure({ connected: true, audioEnabled: true,
     socket: { readyState: 1, send: (raw) => messages.push(JSON.parse(raw)) } });
   return {
-    app, widgets, sockets, messages, element,
+    app, widgets, sockets, messages, element, localStorage, root,
+    event(id, type, payload = { preventDefault() {} }) {
+      const callback = element(id).listeners.get(type);
+      assert.ok(callback, `expected ${type} handler for ${id}`);
+      return callback(payload);
+    },
     now: () => timestamp,
     advance(ms) { timestamp += ms; monotonic += ms; },
     interval(ms) {
@@ -270,4 +284,125 @@ test('a getter arriving after its timeout is invalid even before another attempt
   assert.equal(b.app.status().syncing, false);
   widget.resolvePosition(0);
   assert.equal(widget.calls.filter((call) => call.method === 'play' || call.method === 'seekTo').length, 0);
+});
+
+test('guest volume is personal, persists, and never sends room controls', () => {
+  const b = browser();
+  const widget = load(b, room(b));
+  widget.resolvePosition(10000);
+  b.messages.length = 0;
+  b.element('volume').value = '31';
+  b.event('volume', 'input');
+  assert.equal(widget.volume, 31);
+  assert.equal(b.element('volume-value').textContent, '31%');
+  assert.equal(b.localStorage.getItem('sc-jams:volume'), '31');
+  assert.equal(b.messages.length, 0, 'changing a guest volume must not affect anyone else');
+  const refreshed = browser({ saved: b.localStorage.snapshot() });
+  assert.equal(refreshed.element('volume').value, 31);
+});
+
+test('mute restores the previous volume and a replacement player inherits it', () => {
+  const b = browser();
+  const widget = load(b, room(b));
+  widget.resolvePosition(10000);
+  b.messages.length = 0;
+  b.element('volume').value = '42';
+  b.event('volume', 'input');
+  b.event('mute-button', 'click');
+  assert.equal(widget.volume, 0);
+  assert.equal(b.element('mute-button')['aria-pressed'], 'true');
+  b.event('mute-button', 'click');
+  assert.equal(widget.volume, 42);
+  assert.equal(b.element('mute-button')['aria-pressed'], 'false');
+  const next = load(b, room(b, { id: 'track-b', revision: 2 }));
+  assert.equal(next.volume, 42, 'switching songs must not reset personal volume');
+  assert.equal(b.messages.length, 0);
+});
+
+test('light and dark preference survives refresh and the switch describes its action', () => {
+  const b = browser({ saved: { 'sc-jams:theme': 'dark' } });
+  assert.equal(b.root['data-theme'], 'dark');
+  assert.equal(b.element('theme-toggle')['aria-label'], 'Switch to light mode');
+  b.event('theme-toggle', 'click');
+  assert.equal(b.root['data-theme'], 'light');
+  assert.equal(b.localStorage.getItem('sc-jams:theme'), 'light');
+  const refreshed = browser({ saved: b.localStorage.snapshot() });
+  assert.equal(refreshed.root['data-theme'], 'light');
+  refreshed.event('theme-toggle', 'click');
+  assert.equal(refreshed.root['data-theme'], 'dark');
+  assert.equal(refreshed.element('theme-toggle')['aria-label'], 'Switch to light mode');
+});
+
+test('playlist import validates and deduplicates tracks and respects remaining queue capacity', () => {
+  const b = browser();
+  b.app.configure({ room: room(b) });
+  b.app.previewPlaylist('https://soundcloud.com/artist/sets/a-playlist');
+  const preview = b.widgets.at(-1);
+  preview.emit(EVENTS.READY);
+  const sound = (url, extra = {}) => ({ permalink_url: url, title: 'Example', user: { username: 'Artist' }, duration: 30000, ...extra });
+  preview.resolveSounds([
+    sound('https://www.soundcloud.com/artist/track-a?utm_source=share'), // Already queued.
+    sound('https://www.soundcloud.com/artist/new-track?utm_source=share'),
+    sound('https://soundcloud.com/artist/new-track'), // Same canonical URL.
+    sound('https://soundcloud.com/artist/blocked-track', { access: 'blocked' }),
+    sound('https://soundcloud.com/artist/private-track?secret_token=s-secret'),
+    sound('https://example.com/artist/fake-track'),
+    ...Array.from({ length: 105 }, (_, i) => sound(`https://soundcloud.com/artist/import-${i}`)),
+  ]);
+  assert.equal(b.app.status().playlistTracks.length, 99, 'one existing track leaves 99 spaces');
+  assert.equal(b.element('import-playlist-button').disabled, false);
+  b.event('import-playlist-button', 'click');
+  const batch = b.messages.find((message) => message.type === 'add_many');
+  assert.ok(batch, 'import must send one batch rather than one message for every song');
+  assert.equal(batch.tracks.length, 99);
+  assert.equal(batch.tracks[0].url, 'https://soundcloud.com/artist/new-track');
+  assert.equal(new Set(batch.tracks.map((item) => item.url)).size, 99);
+  assert.ok(!batch.tracks.some((item) => /track-a|blocked|private|example\.com/.test(item.url)));
+  assert.equal(b.element('playlist-import').hidden, true);
+});
+
+test('canceling a playlist ignores its late metadata callback and cannot import it', () => {
+  const b = browser();
+  b.app.configure({ room: room(b) });
+  b.app.previewPlaylist('https://soundcloud.com/artist/sets/a-playlist');
+  const preview = b.widgets.at(-1);
+  preview.emit(EVENTS.READY);
+  b.event('cancel-playlist-button', 'click');
+  preview.resolveSounds([{ permalink_url: 'https://soundcloud.com/artist/new-track', title: 'Late track' }]);
+  b.event('import-playlist-button', 'click');
+  assert.equal(b.app.status().playlistTracks.length, 0);
+  assert.equal(b.messages.filter((message) => message.type === 'add_many').length, 0);
+  assert.equal(b.element('playlist-import').hidden, true);
+});
+
+test('a listener waiting through an ad receives no player corrections until ready, then follows host resume', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, room(b));
+  widget.paused = false;
+  widget.resolvePosition(10000);
+  widget.calls.length = 0;
+  b.messages.length = 0;
+  b.event('wait-button', 'click');
+  assert.equal(b.app.status().waitingLocally, true);
+  assert.equal(b.messages.at(-1).type, 'hold');
+  const held = room(b, { playing: false, position: 10000, revision: 2 });
+  held.hold = { memberId: b.app.clientId, name: 'Me', waiters: [{ memberId: b.app.clientId, name: 'Me', ready: false }] };
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'state', serverTime: b.now(), room: held }) });
+  b.advance(2500);
+  b.interval(2500);
+  widget.emit(EVENTS.SEEK, { currentPosition: 20000 });
+  widget.emit(EVENTS.PAUSE);
+  assert.equal(widget.pendingPositions.length, 0);
+  assert.equal(widget.calls.filter((call) => ['pause', 'seekTo', 'play'].includes(call.method)).length, 0);
+  b.event('wait-button', 'click');
+  assert.equal(b.messages.at(-1).type, 'hold_ready');
+  widget.resolvePosition(20000);
+  assert.ok(!widget.calls.some((call) => call.method === 'play'), 'personal readiness cannot start the paused room');
+  const resumed = room(b, { playing: true, position: 10000, revision: 3 });
+  resumed.hold = null;
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'state', serverTime: b.now(), room: resumed }) });
+  widget.resolvePosition(10000);
+  assert.ok(widget.calls.some((call) => call.method === 'play'), 'host resume starts the ready listener');
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
 });

@@ -10,6 +10,7 @@
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
   <script src="/icons.js" defer></script>
+  <script src="/queue.js" defer></script>
   <script src="https://w.soundcloud.com/player/api.js" defer></script>
   <script src="/app.js" type="module"></script>
 </head>
@@ -59,9 +60,9 @@
           </div>
           <div class="player-caption"><span id="sync-indicator" class="sync-indicator"><i></i>Ready</span><span id="role-hint" class="role-hint">The host controls playback.</span></div>
         </section>
-        <div class="room-meta"><section class="listeners" aria-label="Listeners"><span class="listeners-label"><svg data-icon="users" aria-hidden="true"></svg><span id="people-count">0</span></span><ul id="people" class="people"></ul></section><div class="listening-actions"><button id="wait-button" class="text-button" type="button" title="Pause the room while you catch up" disabled>Wait for me</button><button id="resync-button" class="text-button" type="button" hidden><svg data-icon="rotate-cw" aria-hidden="true"></svg><span>Resync</span></button></div></div>
+        <div class="room-meta"><section class="listeners" aria-label="Listeners"><span class="listeners-label"><svg data-icon="users" aria-hidden="true"></svg><span id="people-count">0</span></span><ul id="people" class="people"></ul></section><div class="listening-actions"><button id="wait-button" class="text-button" type="button" title="Pause everyone's music while you catch up" disabled>Wait for me</button><button id="local-ad-button" class="text-button" type="button" aria-pressed="false" hidden>Let my ad finish</button><button id="resync-button" class="text-button" type="button" hidden><svg data-icon="rotate-cw" aria-hidden="true"></svg><span>Resync</span></button></div></div>
         <section class="queue-section panel" aria-labelledby="queue-title">
-          <div class="section-heading"><h2 id="queue-title">Queue <span id="queue-count">0</span></h2><span class="section-note">Everyone can add music</span></div>
+          <div class="section-heading"><h2 id="queue-title">Queue <span id="queue-count">0</span></h2><span class="section-note">Add music · host can reorder</span></div>
           <form id="add-form"><label class="sr-only" for="track-url">SoundCloud track or playlist link</label><div class="add-input-wrap"><span class="input-icon" aria-hidden="true"><svg data-icon="link"></svg></span><input id="track-url" type="url" required placeholder="Paste a SoundCloud track or playlist link" autocomplete="off"><button id="add-button" class="button secondary" type="submit"><svg data-icon="plus" aria-hidden="true"></svg><span>Add</span></button></div></form>
           <p id="queue-error" class="inline-error" role="alert" hidden></p>
           <section id="playlist-import" class="playlist-import" aria-label="Import playlist" hidden><div id="playlist-preview" class="embed-container"></div><p id="import-status" class="muted" role="status">Loading playlist</p><div class="import-actions"><button id="import-playlist-button" class="button secondary" type="button" disabled>Add playlist</button><button id="cancel-playlist-button" class="text-button" type="button">Cancel</button></div></section>
@@ -70,7 +71,7 @@
       </section>
     </main>
     <footer class="app-footer">
-      <details id="help-details"><summary>How it works</summary><div class="help-content"><p>Paste a public SoundCloud track or playlist link. Anyone can add music; the host controls shared playback. Volume is just for you.</p><p>If you get an ad, choose “Wait for me.” Finish the ad, choose “I'm ready,” then let the host resume. Ad detection is manual.</p><p>sc jams is independent of SoundCloud. Playback and availability are provided by SoundCloud.</p></div></details>
+      <details id="help-details"><summary>How it works</summary><div class="help-content"><p>Paste a public SoundCloud track or playlist link. Finished tracks leave the queue automatically. The host can drag upcoming tracks or use their move buttons to reorder them.</p><p>“Wait for me” pauses everyone's music immediately. Choose “I'm ready” when you're set; the host resumes after everyone is ready. If you're finishing an ad, “Let my ad finish” plays only your audio while the room waits. Ad detection is manual.</p><p>Volume is just for you. sc jams is independent of SoundCloud; playback and availability are provided by SoundCloud.</p></div></details>
       <nav class="footer-links" aria-label="Project links"><a href="https://github.com/bwaeden/sc-jams" target="_blank" rel="noopener noreferrer" class="footer-link" title="View sc jams on GitHub"><svg data-icon="github" aria-hidden="true"></svg><span>GitHub</span></a><a href="/support.html" target="_blank" rel="noopener noreferrer" class="footer-link coffee-link"><svg data-icon="coffee" aria-hidden="true"></svg><span>Buy me a coffee</span></a></nav>
     </footer>
   </div>

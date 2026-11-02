@@ -21,6 +21,8 @@ Open <http://localhost:3000>. In Windows PowerShell, use `npm.cmd` if the execut
 
 No SoundCloud API key or account connection is required. A nickname is optional. `localhost` only works on your computer; friends elsewhere need one shared server at an address everyone can reach.
 
+Listeners who leave the name blank appear as **User**. Session IDs are never used as display names.
+
 ## Use it
 
 1. Create a room and copy its invite link.
@@ -31,6 +33,10 @@ No SoundCloud API key or account connection is required. A nickname is optional.
 Use full URLs such as `https://soundcloud.com/artist/track` or `https://soundcloud.com/artist/sets/playlist`. Open shortened share links in SoundCloud first, then copy the full address. Private tracks, profile pages, and likes pages cannot be pasted as playlists.
 
 Playlist import uses the Widget API's `getSounds` result and adds individual public tracks. Duplicate tracks are omitted, and the shared queue holds at most 100 tracks. The preview may expose only part of a large playlist; restricted or unavailable tracks can still fail during playback.
+
+After playback starts, finishing a track automatically starts the next queued track. Finished or skipped tracks leave the queue instead of accumulating as history. Their rows slide upward and collapse briefly; reduced-motion preferences disable the animation. Finishing the last track leaves an empty, paused queue.
+
+The host can drag upcoming tracks by their handles or use the move-up/move-down buttons. The current track remains first, and reordering does not change playback position. Selecting a different track consumes the current one and plays the selected track in its place while preserving the other upcoming tracks.
 
 Volume and mute affect only your audio. Volume and the light/dark preference are saved in your browser. The page keeps creation, invites, listeners, the queue, and help together. Footer links open GitHub and the support page in another tab so they do not interrupt a jam.
 
@@ -48,9 +54,11 @@ If the host disconnects, their role is reserved for 15 seconds before passing to
 
 Ads are independent for each listener. sc jams cannot detect ad start/end through the documented Widget API, make everyone receive the same ad, or guarantee that connecting a paid account would change embedded-player advertising.
 
-If you get an ad or need time to catch up, choose **Wait for me**. The room pauses for the other listeners, while sc jams leaves your local player alone so your ad can finish. Choose **I'm ready** afterward; the host resumes playback. Several listeners can ask the room to wait and mark themselves ready independently.
+Choose **Wait for me** to pause everyone's music immediately, including your own. Choose **I'm ready** afterward. The host can resume once every waiting listener is ready. Several listeners can wait independently, and a disconnected listener cannot leave the room blocked indefinitely.
 
-This is a manual fallback, not automatic ad synchronization. Buffering, ads, browser restrictions, and track availability can still interrupt alignment. sc jams does not skip or remove SoundCloud advertising.
+If you need an ad to finish, choose **Let my ad finish** while waiting. This explicitly plays only your local audio while everyone else stays paused; it never resumes shared playback. Choosing **I'm ready** pauses local audio again until the host resumes. Waiting no longer assumes that the requester is hearing an ad.
+
+This is a manual fallback, not automatic ad synchronization. SoundCloud's [advertising information](https://community.soundcloud.com/company/advertise) lists embedded players as an audio-ad channel, but this does not establish that every embedded session will receive ads. Buffering, ads, browser restrictions, and track availability can still interrupt alignment. sc jams does not skip or remove SoundCloud advertising.
 
 ## Hosting
 

@@ -134,8 +134,23 @@ input[type="range"]:disabled { cursor: not-allowed; opacity: .3; }
 .input-icon svg { width: 15px; height: 15px; }
 .add-input-wrap .button { height: 44px; min-height: 44px; }
 .queue { list-style: none; padding: 0; margin: 15px -8px 0; max-height: 346px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
-.queue-item { display: flex; align-items: center; gap: 10px; min-height: 60px; padding: 9px 9px; border-radius: 8px; margin-bottom: 3px; }
+.queue-item { display: flex; align-items: center; gap: 10px; min-height: 60px; padding: 9px 9px; border-radius: 8px; margin-bottom: 3px; position: relative; }
 .queue-item.current { background: var(--surface-soft); }
+.queue-item.queue-leaving { overflow: hidden; pointer-events: none; animation: queue-exit 200ms cubic-bezier(.2,.7,.2,1) forwards; }
+.queue-item.queue-dragging { opacity: .45; }
+.queue-item.queue-drop-before::before, .queue-item.queue-drop-after::after { content: ''; position: absolute; left: 8px; right: 8px; height: 2px; border-radius: 2px; background: var(--accent); }
+.queue-item.queue-drop-before::before { top: -2px; }
+.queue-item.queue-drop-after::after { bottom: -2px; }
+.queue-drag-handle { display: grid; place-items: center; width: 20px; height: 34px; flex-shrink: 0; color: var(--muted); cursor: grab; opacity: .55; border-radius: 5px; }
+.queue-drag-handle:hover { opacity: 1; background: var(--hover); }
+.queue-drag-handle:active { cursor: grabbing; }
+.queue-drag-handle svg { width: 16px; height: 16px; }
+.queue-row-actions { display: flex; align-items: center; gap: 1px; flex-shrink: 0; }
+.queue-move-button { display: grid; place-items: center; width: 32px; height: 34px; padding: 0; color: var(--muted); background: transparent; border-radius: 7px; }
+.queue-move-button:hover:not(:disabled) { color: var(--ink); background: var(--hover); }
+.queue-move-button svg { width: 16px; height: 16px; }
+.queue-item.current .queue-row-actions { margin-left: auto; }
+@keyframes queue-exit { from { opacity: 1; transform: translateY(0); height: var(--queue-row-height, 60px); min-height: var(--queue-row-height, 60px); padding-top: 9px; padding-bottom: 9px; margin-bottom: 3px; } to { opacity: 0; transform: translateY(-12px); height: 0; min-height: 0; padding-top: 0; padding-bottom: 0; margin-bottom: 0; } }
 .queue-track { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; padding: 0; background: transparent; color: var(--ink); text-align: left; }
 .queue-track:disabled { opacity: 1; cursor: default; }
 .queue-track:not(:disabled):hover .queue-track-info > strong { color: var(--accent); }

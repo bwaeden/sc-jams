@@ -13,7 +13,8 @@ function sessionValue(key) {
 }
 const clientId = sessionValue('id');
 const token = sessionValue('token');
-const initialName = storage.get('name') || '';
+const rememberedName = storage.get('name') || '';
+const initialName = /^Listener [0-9a-f]{4}$/i.test(rememberedName) ? '' : rememberedName;
 $('create-name').value = initialName;
 $('join-name').value = initialName;
 let socket, room, roomId, displayName, reconnectTimer, pingTimer, heartbeatTimer;
@@ -33,10 +34,13 @@ volume = Math.max(0, Math.min(100, volume));
 let unmutedVolume = volume || 70;
 let playlistWidget, playlistGeneration = 0, playlistTracks = [], playlistTimer;
 let waitingLocally = false;
+let localAdPlaying = false, pendingHold = null, finishingTrackId = null, endPauseTimer;
 const isHost = () => room?.hostId === clientId;
 const serverNow = () => Date.now() + clockOffset;
 const currentTrack = () => room?.queue.find((track) => track.id === room.currentTrackId);
-const playbackState = () => pendingIntent?.trackId === room?.currentTrackId ? pendingIntent : room?.playback;
+const playbackState = () => pendingHold && pendingHold.trackId === room?.currentTrackId ? pendingHold : pendingIntent?.trackId === room?.currentTrackId ? pendingIntent : room?.playback;
+const isHeld = () => Boolean(pendingHold || room?.hold) && !pendingIntent?.playing;
+const unreadyWaiters = () => room?.hold?.waiters?.filter((member) => !member.ready) || [];
 const targetPosition = () => {
   if (!room) return 0;
   const state = playbackState();
@@ -69,6 +73,25 @@ function consumeWidgetEvent(type, positionMs) {
 function handleNativePlayback(playing, event = {}) {
   const position = Number.isFinite(event.currentPosition) ? event.currentPosition : lastPosition;
   const echoed = consumeWidgetEvent(playing ? 'PLAY' : 'PAUSE');
+  if (finishingTrackId === room?.currentTrackId) return;
+  if (isHeld()) {
+    lastWidgetPlaying = playing;
+    if (playing && !localAdPlaying) commandPlayback(false);
+    return;
+  }
+  // A player may emit PAUSE just before FINISH. Give FINISH a brief chance to
+  // consume the track instead of broadcasting a pause that stops the next one.
+  if (!playing && !echoed && isHost() && playbackState()?.playing && knownDuration > 0 && position >= knownDuration - 350) {
+    clearTimeout(endPauseTimer);
+    invalidateReconcile();
+    nativeCheck = null;
+    const trackId = loadedTrackId;
+    endPauseTimer = setTimeout(() => {
+      endPauseTimer = null;
+      if (room?.currentTrackId === trackId && !finishingTrackId && !isHeld()) hostIntent('pause', position, false);
+    }, 180);
+    return;
+  }
   const commit = (actualPlaying) => {
     lastWidgetPlaying = actualPlaying;
     if (actualPlaying) { audioEnabled = true; $('enable-audio').hidden = true; }
@@ -117,6 +140,7 @@ function commandSeek(positionMs) {
 }
 function hostIntent(action, positionMs, commandPlayer = true) {
   if (!isHost() || !connected || !playerReady || !currentTrack() || waitingLocally) return;
+  if (action === 'play' && (pendingHold || unreadyWaiters().length)) return;
   const previous = playbackState();
   nativeCheck = null;
   const playing = action === 'play' ? true : action === 'pause' ? false : previous.playing;
@@ -136,6 +160,23 @@ function hostIntent(action, positionMs, commandPlayer = true) {
     clearIntent();
     invalidateReconcile();
     renderControls();
+    reconcile(true);
+  }, 5000);
+}
+function finishCurrentTrack() {
+  const trackId = room?.currentTrackId;
+  if (!trackId || !isHost() || !connected || isHeld() || !playbackState()?.playing || finishingTrackId === trackId) return;
+  clearTimeout(endPauseTimer);
+  endPauseTimer = null;
+  nativeCheck = null;
+  clearIntent();
+  finishingTrackId = trackId;
+  lastWidgetPlaying = false;
+  send({ type: 'control', action: 'finish', trackId });
+  setSync('Playing the next track');
+  setTimeout(() => {
+    if (finishingTrackId !== trackId || room?.currentTrackId !== trackId) return;
+    finishingTrackId = null;
     reconcile(true);
   }, 5000);
 }
@@ -269,7 +310,7 @@ function showJoin(id) {
 }
 function openRoom(id, name) {
   roomId = id;
-  displayName = name.trim().slice(0, 24) || `Listener ${clientId.slice(0, 4)}`;
+  displayName = name.trim().slice(0, 24) || 'User';
   storage.set('name', displayName);
   history.replaceState(null, '', `/room/${encodeURIComponent(id)}`);
   $('landing').hidden = true;
@@ -303,6 +344,13 @@ function connect() {
       return;
     }
     if (message.type === 'error') {
+      if (pendingHold) {
+        pendingHold = null;
+        waitingLocally = false;
+        localAdPlaying = false;
+        renderControls();
+        reconcile(true);
+      }
       if (pendingIntent) { clearIntent(); invalidateReconcile(); renderControls(); reconcile(true); }
       errorAt('queue-error', message.message);
       if (!joinedOnce || !connected) toast(message.message);
@@ -322,6 +370,8 @@ function connect() {
     const previousPlaying = room?.playback.playing;
     const timelineChanged = room?.playback.updatedAt !== message.room.playback.updatedAt || room?.playback.positionMs !== message.room.playback.positionMs;
     const firstState = !connected;
+    if (message.room.hold || (pendingHold && message.room.currentTrackId !== pendingHold.trackId)) pendingHold = null;
+    if (message.room.hold) { nativeCheck = null; clearIntent(); }
     if (pendingIntent) {
       const state = message.room;
       const expected = pendingIntent.positionMs + (pendingIntent.playing ? state.playback.updatedAt - pendingIntent.updatedAt : 0);
@@ -335,6 +385,11 @@ function connect() {
     reconnectDelay = 600;
     connectionLabel('Connected', true);
     renderRoom();
+    if (isHeld() && !localAdPlaying) {
+      nativeCheck = null;
+      invalidateReconcile();
+      commandPlayback(false);
+    }
     if (firstState) {
       clearInterval(pingTimer);
       const ping = () => send({ type: 'ping', sentAt: Date.now() });
@@ -358,6 +413,9 @@ function connect() {
   next.addEventListener('close', (event) => {
     if (socket !== next) return;
     connected = false;
+    pendingHold = null;
+    localAdPlaying = false;
+    finishingTrackId = null;
     nativeCheck = null;
     clearIntent();
     widgetEchoes = [];
@@ -394,8 +452,8 @@ function el(tag, className, text) {
 function renderRoom() {
   $('room-subtitle').textContent = isHost() ? 'You’re hosting' : 'Listening together';
   const waiter = room.hold?.waiters?.find((member) => member.memberId === clientId);
-  if (!room.hold || waiter?.ready) waitingLocally = false;
-  else if (waiter || room.hold.memberId === clientId) waitingLocally = true;
+  if ((!room.hold && !pendingHold) || waiter?.ready) { waitingLocally = false; localAdPlaying = false; }
+  else if (waiter || room.hold?.memberId === clientId) waitingLocally = true;
   $('people-count').textContent = room.members.filter((member) => member.connected).length;
   $('people').replaceChildren(...room.members.map((member, index) => {
     const item = el('li', `person${member.connected ? '' : ' away'}`);
@@ -407,7 +465,13 @@ function renderRoom() {
   }));
   $('queue-count').textContent = room.queue.length;
   $('empty-queue').hidden = room.queue.length > 0;
-  $('queue').replaceChildren(...room.queue.map((track, index) => {
+  if (window.SCJamsQueue?.render) {
+    window.SCJamsQueue.render({ queue: room.queue, currentTrackId: room.currentTrackId, isHost: isHost(), connected, members: room.members,
+      onSelect: (trackId) => send({ type: 'control', action: 'select', trackId }),
+      onRemove: (trackId) => send({ type: 'control', action: 'remove', trackId }),
+      onReorder: (trackIds) => send({ type: 'control', action: 'reorder', trackIds }),
+    });
+  } else $('queue').replaceChildren(...room.queue.map((track, index) => {
     const active = track.id === room.currentTrackId;
     const item = el('li', `queue-item${active ? ' current' : ''}`);
     const select = el('button', 'queue-track');
@@ -446,7 +510,7 @@ function renderRoom() {
 }
 function renderControls() {
   const track = currentTrack();
-  const controls = Boolean(isHost() && track && connected && playerReady && !playerUnavailable && !waitingLocally);
+  const controls = Boolean(isHost() && track && connected && playerReady && !playerUnavailable && !waitingLocally && !pendingHold && !unreadyWaiters().length);
   $('play-button').disabled = !controls;
   const nextIndex = room?.queue.findIndex((entry) => entry.id === room.currentTrackId) ?? -1;
   $('skip-button').disabled = !isHost() || !connected || nextIndex < 0 || nextIndex >= (room?.queue.length || 0) - 1;
@@ -458,16 +522,21 @@ function renderControls() {
   $('play-button').setAttribute('aria-label', playing ? 'Pause shared track' : 'Play shared track');
   $('playback-label').textContent = track ? !playerReady ? 'Loading player' : playerUnavailable ? 'Unavailable' : playing ? 'Playing' : 'Paused' : '';
   const waiting = room?.hold?.waiters?.filter((member) => !member.ready).map((member) => member.name) || (room?.hold ? [room.hold.name] : []);
-  $('role-hint').textContent = room?.hold ? waiting.length ? `Waiting for ${waiting.join(', ')}` : 'Everyone is ready. Host can resume.' : isHost() ? 'You control playback.' : 'Following the host.';
-  $('wait-button').textContent = waitingLocally ? 'I’m ready' : 'Wait for me';
-  $('wait-button').disabled = !track || !connected;
+  const ownWaiter = room?.hold?.waiters?.find((member) => member.memberId === clientId);
+  $('role-hint').textContent = pendingHold ? 'Pausing the room…' : room?.hold ? waiting.length ? `Paused · waiting for ${waiting.join(', ')}` : 'Everyone is ready. Host can resume.' : isHost() ? 'You control playback.' : 'Following the host.';
+  $('wait-button').textContent = waitingLocally ? 'I’m ready' : ownWaiter?.ready ? 'Ready' : 'Wait for me';
+  $('wait-button').disabled = !track || !connected || Boolean(ownWaiter?.ready) || Boolean(pendingHold);
+  $('local-ad-button').hidden = !waitingLocally || !isHeld();
+  $('local-ad-button').disabled = !connected || !playerReady || playerUnavailable;
+  $('local-ad-button').textContent = localAdPlaying ? 'Pause my audio' : 'Let my ad finish';
+  $('local-ad-button').setAttribute('aria-pressed', String(localAdPlaying));
   $('volume').disabled = false;
   $('resync-button').hidden = !track;
   $('resync-button').disabled = waitingLocally || !playerReady || !connected || playerUnavailable;
   $('enable-audio').hidden = !track || audioEnabled;
   $('enable-audio').disabled = !playerReady || !connected || playerUnavailable;
 }
-function eventsAllowed() { return isHost() && connected && playerReady && !waitingLocally; }
+function eventsAllowed() { return isHost() && connected && playerReady && !isHeld() && !finishingTrackId; }
 function clearPlayer() {
   loadGeneration++;
   nativeCheck = null;
@@ -478,6 +547,9 @@ function clearPlayer() {
   syncAttempt++;
   playerReady = false;
   loadedTrackId = null;
+  finishingTrackId = null;
+  clearTimeout(endPauseTimer);
+  endPauseTimer = null;
   if (widget) widget.pause();
   widget = null;
   knownDuration = 0;
@@ -490,6 +562,9 @@ function clearPlayer() {
 function loadTrack(track) {
   if (loadedTrackId === track.id) return;
   const generation = ++loadGeneration;
+  finishingTrackId = null;
+  clearTimeout(endPauseTimer);
+  endPauseTimer = null;
   nativeCheck = null;
   clearIntent();
   widgetEchoes = [];
@@ -514,7 +589,8 @@ function loadTrack(track) {
   iframe.allow = 'autoplay';
   iframe.height = '166';
   iframe.scrolling = 'no';
-  iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(track.url)}&auto_play=false&color=%23f5613c&hide_related=true&show_comments=false&show_user=true&show_reposts=false&visual=false`;
+  const continuePlaying = audioEnabled && room?.playback.playing && !isHeld();
+  iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(track.url)}&auto_play=${continuePlaying}&single_active=false&color=%23f5613c&hide_related=true&show_comments=false&show_user=true&show_reposts=false&visual=false`;
   $('embed-container').replaceChildren(iframe);
   function bindWidget(attempt = 0) {
     if (generation !== loadGeneration) return;
@@ -535,6 +611,7 @@ function loadTrack(track) {
       playerReady = true;
       renderControls();
       applyVolume();
+      if (audioEnabled && playbackState()?.playing && !isHeld()) commandPlayback(true);
       instance.getDuration((duration) => { if (valid()) { knownDuration = duration || 0; renderControls(); } });
       instance.getCurrentSound((sound) => {
         if (!valid() || !sound) return;
@@ -572,7 +649,7 @@ function loadTrack(track) {
       else if (!isHost()) setTimeout(() => reconcile(true), 100);
     });
     instance.bind(events.FINISH, () => {
-      if (valid() && isHost() && connected && !waitingLocally && room?.playback.playing) send({ type: 'control', action: 'skip' });
+      if (valid()) finishCurrentTrack();
     });
     instance.bind(events.ERROR, () => {
       if (!valid()) return;
@@ -593,16 +670,20 @@ function loadTrack(track) {
   }, 18000);
 }
 function reconcile(force = false) {
-  // The requester finishes their ad locally. Widget events cannot identify ads,
-  // so no seek/pause/play commands are sent until they explicitly mark ready.
-  if (waitingLocally) { setSync('Finish your ad, then choose “I’m ready”', true); return; }
+  if (finishingTrackId === room?.currentTrackId || endPauseTimer) return;
+  if (isHeld()) {
+    if (localAdPlaying) { setSync('Only your audio is playing · the room is paused', true); return; }
+    commandPlayback(false);
+    setSync('Room paused while listeners get ready', true);
+    return;
+  }
   if (nativeCheck) return;
   if (!widget || !playerReady || !connected || !currentTrack() || playerUnavailable) return;
   if (syncing) { pendingForce ||= force; return; }
   const instance = widget, generation = loadGeneration, attempt = ++syncAttempt, serial = intentSerial;
   let active = true;
   syncing = true;
-  const valid = () => active && connected && !waitingLocally && generation === loadGeneration && instance === widget && attempt === syncAttempt && serial === intentSerial;
+  const valid = () => active && connected && !isHeld() && generation === loadGeneration && instance === widget && attempt === syncAttempt && serial === intentSerial;
   const finish = () => {
     if (!valid()) return;
     active = false;
@@ -719,8 +800,7 @@ $('skip-button').addEventListener('click', () => {
   if ($('skip-button').disabled) return;
   clearIntent();
   invalidateReconcile();
-  commandPlayback(false);
-  send({ type: 'control', action: 'skip' });
+  send({ type: 'control', action: 'skip', trackId: room.currentTrackId });
 });
 $('seek').addEventListener('change', () => {
   if ($('seek').disabled) return;
@@ -756,17 +836,43 @@ $('wait-button').addEventListener('click', () => {
   if (!connected || !currentTrack()) return;
   if (waitingLocally) {
     waitingLocally = false;
+    localAdPlaying = false;
+    nativeCheck = null;
+    clearIntent();
+    commandPlayback(false);
     send({ type: 'hold_ready' });
     reconcile(true);
   } else {
     waitingLocally = true;
+    localAdPlaying = false;
+    nativeCheck = null;
     clearIntent();
-    syncing = false;
-    pendingForce = false;
-    syncAttempt++;
-    send({ type: 'hold' });
-    setSync('Finish your ad, then choose “I’m ready”', true);
+    pendingHold = { trackId: room.currentTrackId, playing: false, positionMs: lastPosition, updatedAt: serverNow() };
+    commandPlayback(false);
+    if (!send({ type: 'hold' })) { pendingHold = null; waitingLocally = false; }
+    else {
+      const request = pendingHold;
+      setTimeout(() => {
+        if (pendingHold !== request) return;
+        pendingHold = null;
+        waitingLocally = false;
+        localAdPlaying = false;
+        renderControls();
+        reconcile(true);
+        toast('The pause request was not confirmed. Try again.');
+      }, 5000);
+    }
+    setSync('Pausing the room', true);
   }
+  renderControls();
+});
+$('local-ad-button').addEventListener('click', () => {
+  if (!waitingLocally || !isHeld() || !connected || !playerReady || playerUnavailable) return;
+  nativeCheck = null;
+  invalidateReconcile();
+  localAdPlaying = !localAdPlaying;
+  audioEnabled = true;
+  commandPlayback(localAdPlaying);
   renderControls();
 });
 $('import-playlist-button').addEventListener('click', () => {
@@ -784,6 +890,9 @@ function leaveRoom() {
   previous?.close();
   connected = false;
   waitingLocally = false;
+  pendingHold = null;
+  localAdPlaying = false;
+  window.SCJamsQueue?.clear();
   closePlaylist();
   clearPlayer();
   room = null;

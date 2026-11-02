@@ -128,8 +128,7 @@ export function createRoomStore({
   function join(roomId, { clientId, token, name }, socket) {
     const room = get(roomId);
     requireValue(UUID.test(clientId ?? '') && UUID.test(token ?? ''), 'invalid_identity', 'Your browser could not create a session. Refresh and try again.');
-    const nickname = text(name, 24);
-    requireValue(nickname.length > 0, 'invalid_name', 'Enter a nickname to join.');
+    const nickname = text(name, 24) || 'User';
     let member = room.members.get(clientId);
     if (member) {
       const known = Buffer.from(member.token);
@@ -158,6 +157,9 @@ export function createRoomStore({
     if (!rooms.has(room.id) || member.socket !== socket) return;
     member.socket = null;
     member.connected = false;
+    // A departed listener must not leave the whole room waiting indefinitely.
+    const waiter = room.hold?.waiters.find((item) => item.memberId === member.id);
+    if (waiter) waiter.ready = true;
     if (room.hostId === member.id) {
       member.hostTimer = later(() => {
         if (member.connected || !rooms.has(room.id) || room.hostId !== member.id) return;
@@ -186,7 +188,15 @@ export function createRoomStore({
 
   function select(room, trackId, playing = room.playback.playing) {
     room.currentTrackId = trackId;
-    room.playback = { playing: Boolean(trackId && playing), positionMs: 0, updatedAt: now() };
+    room.playback = { playing: Boolean(trackId && playing && !room.hold), positionMs: 0, updatedAt: now() };
+    if (!trackId) room.hold = null;
+  }
+
+  function advance(room) {
+    const playing = room.playback.playing;
+    const index = room.queue.findIndex((track) => track.id === room.currentTrackId);
+    if (index >= 0) room.queue.splice(index, 1);
+    select(room, room.queue[0]?.id ?? null, playing);
   }
 
   function apply(room, member, message) {
@@ -214,8 +224,9 @@ export function createRoomStore({
     } else if (message.type === 'hold') {
       requireValue(room.currentTrackId, 'empty_queue', 'Add a track before asking the room to wait.');
       const at = now();
+      const wasPlaying = room.playback.playing;
       room.playback = { playing: false, positionMs: getPosition(room, at), updatedAt: at };
-      room.hold ??= { memberId: member.id, name: member.name, reason: 'manual', at, waiters: [] };
+      room.hold ??= { memberId: member.id, name: member.name, reason: 'manual', at, wasPlaying, waiters: [] };
       const waiter = room.hold.waiters.find((item) => item.memberId === member.id);
       if (waiter) { waiter.name = member.name; waiter.ready = false; }
       else room.hold.waiters.push({ memberId: member.id, name: member.name, ready: false });
@@ -250,26 +261,41 @@ export function createRoomStore({
       const currentIndex = room.queue.findIndex((track) => track.id === room.currentTrackId);
       if (message.action === 'select') {
         requireValue(room.queue.some((track) => track.id === message.trackId), 'track_not_found', 'This track is no longer in the queue.');
+        if (message.trackId !== room.currentTrackId) {
+          // Selecting an upcoming track starts it now and consumes the old one.
+          if (currentIndex >= 0) room.queue.splice(currentIndex, 1);
+          const index = room.queue.findIndex((track) => track.id === message.trackId);
+          const [selected] = room.queue.splice(index, 1);
+          room.queue.unshift(selected);
+        }
         select(room, message.trackId);
+      } else if (message.action === 'reorder') {
+        const ids = message.trackIds;
+        const expected = new Set(room.queue.map((track) => track.id));
+        requireValue(Array.isArray(ids) && ids.length === room.queue.length && new Set(ids).size === ids.length && ids.every((id) => typeof id === 'string' && expected.has(id)), 'invalid_order', 'Reorder the current queue without adding or removing tracks.');
+        requireValue(!room.currentTrackId || ids[0] === room.currentTrackId, 'current_track_locked', 'The playing track stays first. Reorder the upcoming tracks.');
+        if (ids.every((id, index) => room.queue[index].id === id)) return;
+        const tracks = new Map(room.queue.map((track) => [track.id, track]));
+        room.queue = ids.map((id) => tracks.get(id));
       } else if (message.action === 'remove') {
         const index = room.queue.findIndex((track) => track.id === message.trackId);
         requireValue(index >= 0, 'track_not_found', 'This track is no longer in the queue.');
         const removingCurrent = message.trackId === room.currentTrackId;
         room.queue.splice(index, 1);
-        if (removingCurrent) select(room, room.queue[index]?.id ?? room.queue[0]?.id ?? null);
-      } else if (message.action === 'skip') {
+        if (removingCurrent) select(room, room.queue[0]?.id ?? null);
+      } else if (message.action === 'skip' || message.action === 'finish') {
+        // Iframe callbacks can arrive twice or after a track switch. Never let
+        // an old completion consume the new current track.
+        if (message.action === 'finish' && (message.trackId !== room.currentTrackId || !room.playback.playing || room.hold)) return;
+        if (message.action === 'skip' && message.trackId !== undefined && message.trackId !== room.currentTrackId) return;
         requireValue(currentIndex >= 0, 'empty_queue', 'Add a track to start listening.');
-        // End the queue instead of unexpectedly repeating earlier tracks.
-        const next = room.queue[currentIndex + 1];
-        if (next) select(room, next.id);
-        else {
-          room.playback = { playing: false, positionMs: 0, updatedAt: now() };
-        }
+        advance(room);
       } else {
         requireValue(currentIndex >= 0, 'empty_queue', 'Add a track to start listening.');
         const current = room.queue[currentIndex];
         const nextPosition = message.positionMs === undefined ? getPosition(room, now()) : position(message.positionMs);
         requireValue(['play', 'pause', 'seek'].includes(message.action), 'invalid_action', 'Choose a valid playback action.');
+        if (message.action === 'play') requireValue(!room.hold?.waiters.some((waiter) => !waiter.ready), 'room_waiting', 'The room is waiting. Everyone must choose “I’m ready” before you resume.');
         room.playback = { playing: message.action === 'play' ? true : message.action === 'pause' ? false : room.playback.playing,
           positionMs: Math.min(nextPosition, current.duration || MAX_DURATION), updatedAt: now() };
         if (message.action === 'play') room.hold = null;

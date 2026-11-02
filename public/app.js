@@ -20,8 +20,10 @@ let socket, room, roomId, displayName, reconnectTimer, pingTimer, heartbeatTimer
 let reconnectDelay = 600, stopped = false, connected = false;
 let clockOffset = 0, clockSamples = [], lastRevision = -1, joinedOnce = false;
 let widget, loadedTrackId, playerReady = false, loadGeneration = 0;
-let audioEnabled = false, syncing = false, ignoreEventsUntil = 0, lastCorrection = 0;
+let audioEnabled = false, syncing = false, lastCorrection = 0;
 let pendingForce = false, syncAttempt = 0;
+let pendingIntent = null, intentSerial = 0, widgetEchoes = [];
+let nativeCheck = null;
 let lastPosition = 0, lastPositionAt = 0, knownDuration = 0, lastWidgetPlaying = false;
 let lastHostReport = 0, playerUnavailable = false;
 let toastTimer, firstTrack;
@@ -34,13 +36,109 @@ let waitingLocally = false;
 const isHost = () => room?.hostId === clientId;
 const serverNow = () => Date.now() + clockOffset;
 const currentTrack = () => room?.queue.find((track) => track.id === room.currentTrackId);
+const playbackState = () => pendingIntent?.trackId === room?.currentTrackId ? pendingIntent : room?.playback;
 const targetPosition = () => {
   if (!room) return 0;
-  const state = room.playback;
+  const state = playbackState();
   let position = state.positionMs + (state.playing ? Math.max(0, serverNow() - state.updatedAt) : 0);
   const duration = currentTrack()?.duration || knownDuration;
   return Math.max(0, duration ? Math.min(position, duration) : position);
 };
+function icon(name) {
+  if (window.SCJamsIcons?.svg) return window.SCJamsIcons.svg(name);
+  const paths = { play: '<path d="m8 5 11 7-11 7Z" fill="currentColor" stroke="none"/>', pause: '<path d="M8 5v14M16 5v14"/>', sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1 1m12 12 1 1M5 19l1-1M18 6l1-1"/>', moon: '<path d="M20 13a8 8 0 0 1-9-9 8 8 0 1 0 9 9Z"/>', 'volume-2': '<path d="m11 5-6 4H2v6h3l6 4Zm4 3a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/>', 'volume-x': '<path d="m11 5-6 4H2v6h3l6 4Zm5 4 5 6m0-6-5 6"/>', 'audio-lines': '<path d="M4 10v4m4-7v10m4-14v18m4-14v10m4-7v4"/>', x: '<path d="m6 6 12 12M6 18 18 6"/>' };
+  return `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || ''}</svg>`;
+}
+function invalidateReconcile() {
+  syncing = false;
+  pendingForce = false;
+  syncAttempt++;
+}
+function clearIntent() { pendingIntent = null; intentSerial++; invalidateReconcile(); }
+function expectWidgetEvent(type, positionMs) {
+  widgetEchoes = widgetEchoes.filter((entry) => entry.until > performance.now());
+  widgetEchoes.push({ type, positionMs, until: performance.now() + 4000 });
+}
+function consumeWidgetEvent(type, positionMs) {
+  widgetEchoes = widgetEchoes.filter((entry) => entry.until > performance.now());
+  const index = widgetEchoes.findIndex((entry) => entry.type === type && (type !== 'SEEK' || Math.abs(entry.positionMs - positionMs) < 300));
+  if (index < 0) return false;
+  widgetEchoes.splice(index, 1);
+  return true;
+}
+function handleNativePlayback(playing, event = {}) {
+  const position = Number.isFinite(event.currentPosition) ? event.currentPosition : lastPosition;
+  const echoed = consumeWidgetEvent(playing ? 'PLAY' : 'PAUSE');
+  const commit = (actualPlaying) => {
+    lastWidgetPlaying = actualPlaying;
+    if (actualPlaying) { audioEnabled = true; $('enable-audio').hidden = true; }
+    if (eventsAllowed() && playbackState().playing !== actualPlaying) hostIntent(actualPlaying ? 'play' : 'pause', position, false);
+    else if (!isHost() && room?.playback.playing !== actualPlaying) setTimeout(() => reconcile(true), 50);
+  };
+  if (echoed && playing === playbackState()?.playing) {
+    if (!nativeCheck) lastWidgetPlaying = playing;
+    return;
+  }
+  if (!echoed) { nativeCheck = null; commit(playing); return; }
+  // An event matching an older command may instead be a fresh native click.
+  // Ask for actual play state only in this ambiguous case, while preventing a
+  // sync loop from undoing the click. Never guess from a time suppression window.
+  invalidateReconcile();
+  const check = { instance: widget, generation: loadGeneration };
+  nativeCheck = check;
+  const valid = () => nativeCheck === check && check.instance === widget && check.generation === loadGeneration && connected;
+  widget.isPaused((paused) => {
+    if (!valid()) return;
+    nativeCheck = null;
+    if (!paused === playing) commit(playing);
+    else {
+      lastWidgetPlaying = !paused;
+      if (!paused !== playbackState()?.playing) reconcile(true);
+    }
+  });
+  setTimeout(() => {
+    if (!valid()) return;
+    nativeCheck = null;
+    commit(playing);
+  }, 1500);
+}
+function commandPlayback(playing) {
+  if (!widget || !playerReady) return;
+  if (lastWidgetPlaying !== playing) expectWidgetEvent(playing ? 'PLAY' : 'PAUSE');
+  lastWidgetPlaying = playing;
+  if (playing) widget.play(); else widget.pause();
+}
+function commandSeek(positionMs) {
+  if (!widget || !playerReady) return;
+  expectWidgetEvent('SEEK', positionMs);
+  lastPosition = positionMs;
+  lastPositionAt = performance.now();
+  widget.seekTo(positionMs);
+}
+function hostIntent(action, positionMs, commandPlayer = true) {
+  if (!isHost() || !connected || !playerReady || !currentTrack() || waitingLocally) return;
+  const previous = playbackState();
+  nativeCheck = null;
+  const playing = action === 'play' ? true : action === 'pause' ? false : previous.playing;
+  const position = Math.max(0, Math.min(knownDuration || 86400000, Number(positionMs) || 0));
+  pendingIntent = { trackId: room.currentTrackId, playing, positionMs: position, updatedAt: serverNow(), baseRevision: room.revision, serial: ++intentSerial };
+  const serial = pendingIntent.serial;
+  invalidateReconcile();
+  if (!send({ type: 'control', action, positionMs: position })) { clearIntent(); return; }
+  if (commandPlayer) {
+    if (action === 'seek') commandSeek(position);
+    else commandPlayback(playing);
+  }
+  renderControls();
+  // A slow or rejected command cannot leave the UI indefinitely optimistic.
+  setTimeout(() => {
+    if (pendingIntent?.serial !== serial) return;
+    clearIntent();
+    invalidateReconcile();
+    renderControls();
+    reconcile(true);
+  }, 5000);
+}
 function send(message) {
   if (socket?.readyState !== WebSocket.OPEN || !connected) return false;
   socket.send(JSON.stringify(message));
@@ -86,7 +184,7 @@ function musicLink(value) {
 function applyVolume() {
   $('volume').value = volume;
   $('volume-value').textContent = `${volume}%`;
-  $('mute-button').innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z"/>${volume === 0 ? '<path d="m16 9 5 6m0-6-5 6"/>' : '<path d="M15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/>'}</svg>`;
+  $('mute-button').innerHTML = icon(volume === 0 ? 'volume-x' : 'volume-2');
   $('mute-button').setAttribute('aria-label', volume === 0 ? 'Unmute your audio' : 'Mute your audio');
   $('mute-button').setAttribute('aria-pressed', String(volume === 0));
   if (widget && playerReady) widget.setVolume(volume);
@@ -94,35 +192,10 @@ function applyVolume() {
 }
 function applyTheme(theme) {
   document.documentElement?.setAttribute('data-theme', theme);
-  $('theme-toggle').textContent = theme === 'dark' ? '☀' : '◐';
+  $('theme-toggle').innerHTML = icon(theme === 'dark' ? 'sun' : 'moon');
   $('theme-toggle').setAttribute('aria-label', theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
   $('theme-toggle').setAttribute('aria-pressed', String(theme === 'dark'));
   storage.set('theme', theme);
-}
-async function loadLinks() {
-  $('links-toggle').hidden = true;
-  try {
-    const response = await fetch('/links.json');
-    if (!response.ok) return;
-    const configured = await response.json();
-    if (!Array.isArray(configured)) return;
-    const links = [];
-    for (const link of configured.slice(0, 8)) {
-      try {
-        const url = new URL(link.url);
-        if (url.protocol !== 'https:' || url.username || url.password || typeof link.label !== 'string' || !link.label.trim()) continue;
-        const anchor = document.createElement('a');
-        anchor.textContent = link.label.trim().slice(0, 40);
-        anchor.href = url.href;
-        anchor.target = '_blank';
-        anchor.rel = 'noopener noreferrer';
-        links.push(anchor);
-      } catch { /* Ignore incomplete optional links. */ }
-    }
-    if (!links.length) return;
-    $('links-panel').replaceChildren(...links);
-    $('links-toggle').hidden = false;
-  } catch { /* Optional social links never block creating a room. */ }
 }
 function closePlaylist() {
   playlistGeneration++;
@@ -230,6 +303,7 @@ function connect() {
       return;
     }
     if (message.type === 'error') {
+      if (pendingIntent) { clearIntent(); invalidateReconcile(); renderControls(); reconcile(true); }
       errorAt('queue-error', message.message);
       if (!joinedOnce || !connected) toast(message.message);
       // Join failures must not reconnect forever or silently claim to be connected.
@@ -248,6 +322,12 @@ function connect() {
     const previousPlaying = room?.playback.playing;
     const timelineChanged = room?.playback.updatedAt !== message.room.playback.updatedAt || room?.playback.positionMs !== message.room.playback.positionMs;
     const firstState = !connected;
+    if (pendingIntent) {
+      const state = message.room;
+      const expected = pendingIntent.positionMs + (pendingIntent.playing ? state.playback.updatedAt - pendingIntent.updatedAt : 0);
+      const acknowledged = state.revision > pendingIntent.baseRevision && state.playback.playing === pendingIntent.playing && Math.abs(state.playback.positionMs - expected) < 2000;
+      if (acknowledged || state.currentTrackId !== pendingIntent.trackId || state.hostId !== clientId || state.hold) clearIntent();
+    }
     if (!clockSamples.length) clockOffset = message.serverTime - Date.now();
     room = message.room;
     lastRevision = room.revision;
@@ -278,13 +358,15 @@ function connect() {
   next.addEventListener('close', (event) => {
     if (socket !== next) return;
     connected = false;
+    nativeCheck = null;
+    clearIntent();
+    widgetEchoes = [];
     syncing = false;
     pendingForce = false;
     syncAttempt++;
     clearInterval(pingTimer);
     if (widget && playerReady) {
-      suppressEvents();
-      widget.pause();
+      commandPlayback(false);
       lastWidgetPlaying = false;
     }
     renderControls();
@@ -332,7 +414,9 @@ function renderRoom() {
     select.type = 'button';
     select.disabled = !isHost() || !connected;
     select.title = isHost() ? 'Select this track' : 'The host selects tracks';
-    select.append(el('span', 'queue-number', active ? '♫' : String(index + 1).padStart(2, '0')));
+    const number = el('span', 'queue-number', active ? '' : String(index + 1).padStart(2, '0'));
+    if (active) number.innerHTML = icon('audio-lines');
+    select.append(number);
     const info = el('span', 'queue-track-info');
     const contributor = room.members.find((member) => member.id === track.addedBy)?.name || 'a friend';
     info.append(el('strong', '', track.title || track.url.split('/').at(-1).replaceAll('-', ' ')), el('span', '', active ? 'Now playing' : `Added by ${contributor}`));
@@ -340,7 +424,8 @@ function renderRoom() {
     select.addEventListener('click', () => send({ type: 'control', action: 'select', trackId: track.id }));
     item.append(select);
     if (isHost()) {
-      const remove = el('button', 'remove-track', '×');
+      const remove = el('button', 'remove-track');
+      remove.innerHTML = icon('x');
       remove.type = 'button';
       remove.setAttribute('aria-label', `Remove ${track.title || 'track'} from queue`);
       remove.disabled = !connected;
@@ -350,6 +435,7 @@ function renderRoom() {
     return item;
   }));
   const track = currentTrack();
+  $('track-link').hidden = !track;
   if (track) {
     $('track-title').textContent = track.title || track.url.split('/').at(-1).replaceAll('-', ' ');
     $('track-artist').textContent = track.artist || 'SoundCloud';
@@ -360,33 +446,39 @@ function renderRoom() {
 }
 function renderControls() {
   const track = currentTrack();
-  const controls = Boolean(isHost() && track && connected);
+  const controls = Boolean(isHost() && track && connected && playerReady && !playerUnavailable && !waitingLocally);
   $('play-button').disabled = !controls;
-  $('skip-button').disabled = !controls || !room?.queue.length;
+  const nextIndex = room?.queue.findIndex((entry) => entry.id === room.currentTrackId) ?? -1;
+  $('skip-button').disabled = !isHost() || !connected || nextIndex < 0 || nextIndex >= (room?.queue.length || 0) - 1;
   $('seek').disabled = !controls || !knownDuration;
   $('add-button').disabled = !connected;
-  $('play-icon').textContent = room?.playback.playing ? 'Ⅱ' : '▶';
-  $('play-button').setAttribute('aria-label', room?.playback.playing ? 'Pause shared track' : 'Play shared track');
-  $('playback-label').textContent = track ? room.playback.playing ? 'Playing' : 'Paused' : '';
+  $('import-playlist-button').disabled = !connected || !playlistTracks.length;
+  const playing = playbackState()?.playing;
+  $('play-icon').innerHTML = icon(playing ? 'pause' : 'play');
+  $('play-button').setAttribute('aria-label', playing ? 'Pause shared track' : 'Play shared track');
+  $('playback-label').textContent = track ? !playerReady ? 'Loading player' : playerUnavailable ? 'Unavailable' : playing ? 'Playing' : 'Paused' : '';
   const waiting = room?.hold?.waiters?.filter((member) => !member.ready).map((member) => member.name) || (room?.hold ? [room.hold.name] : []);
   $('role-hint').textContent = room?.hold ? waiting.length ? `Waiting for ${waiting.join(', ')}` : 'Everyone is ready. Host can resume.' : isHost() ? 'You control playback.' : 'Following the host.';
   $('wait-button').textContent = waitingLocally ? 'I’m ready' : 'Wait for me';
   $('wait-button').disabled = !track || !connected;
   $('volume').disabled = false;
   $('resync-button').hidden = !track;
-  $('resync-button').disabled = waitingLocally;
+  $('resync-button').disabled = waitingLocally || !playerReady || !connected || playerUnavailable;
   $('enable-audio').hidden = !track || audioEnabled;
+  $('enable-audio').disabled = !playerReady || !connected || playerUnavailable;
 }
-function suppressEvents() { ignoreEventsUntil = performance.now() + 1100; }
-function eventsAllowed() { return isHost() && connected && playerReady && !waitingLocally && !syncing && performance.now() > ignoreEventsUntil; }
+function eventsAllowed() { return isHost() && connected && playerReady && !waitingLocally; }
 function clearPlayer() {
   loadGeneration++;
+  nativeCheck = null;
+  clearIntent();
+  widgetEchoes = [];
   syncing = false;
   pendingForce = false;
   syncAttempt++;
   playerReady = false;
   loadedTrackId = null;
-  if (widget) { suppressEvents(); widget.pause(); }
+  if (widget) widget.pause();
   widget = null;
   knownDuration = 0;
   lastPosition = 0;
@@ -398,6 +490,9 @@ function clearPlayer() {
 function loadTrack(track) {
   if (loadedTrackId === track.id) return;
   const generation = ++loadGeneration;
+  nativeCheck = null;
+  clearIntent();
+  widgetEchoes = [];
   syncing = false;
   pendingForce = false;
   syncAttempt++;
@@ -407,10 +502,11 @@ function loadTrack(track) {
   knownDuration = track.duration || 0;
   lastPosition = 0;
   lastWidgetPlaying = false;
-  if (widget) { suppressEvents(); widget.pause(); }
+  if (widget) widget.pause();
   widget = null;
   $('empty-player').hidden = true;
   $('active-player').hidden = false;
+  renderControls();
   errorAt('player-error');
   setSync('Getting the track ready');
   const iframe = document.createElement('iframe');
@@ -426,6 +522,8 @@ function loadTrack(track) {
       if (attempt < 40) { setTimeout(() => bindWidget(attempt + 1), 250); return; }
       errorAt('player-error', 'The SoundCloud player could not load. Check your connection or allow SoundCloud in your browser’s privacy settings.');
       setSync('Player unavailable', true);
+      playerUnavailable = true;
+      renderControls();
       return;
     }
     const instance = window.SC.Widget(iframe);
@@ -435,6 +533,7 @@ function loadTrack(track) {
     instance.bind(events.READY, () => {
       if (!valid()) return;
       playerReady = true;
+      renderControls();
       applyVolume();
       instance.getDuration((duration) => { if (valid()) { knownDuration = duration || 0; renderControls(); } });
       instance.getCurrentSound((sound) => {
@@ -454,28 +553,23 @@ function loadTrack(track) {
         $('enable-audio').hidden = true;
       }
     });
-    instance.bind(events.PLAY, () => {
+    instance.bind(events.PLAY, (event = {}) => {
       if (!valid()) return;
-      lastWidgetPlaying = true;
-      audioEnabled = true;
-      $('enable-audio').hidden = true;
-      if (eventsAllowed() && !room.playback.playing) send({ type: 'control', action: 'play', positionMs: lastPosition });
-      else if (!isHost() && !room?.playback.playing) setTimeout(() => reconcile(true), 50);
+      handleNativePlayback(true, event);
     });
-    instance.bind(events.PAUSE, () => {
+    instance.bind(events.PAUSE, (event = {}) => {
       if (!valid()) return;
-      lastWidgetPlaying = false;
-      if (eventsAllowed() && room.playback.playing) {
-        const revision = room.revision;
-        instance.getPosition((position) => { if (valid() && eventsAllowed() && room.revision === revision && room.playback.playing) send({ type: 'control', action: 'pause', positionMs: position }); });
-      } else if (!isHost() && room?.playback.playing && audioEnabled) setTimeout(() => reconcile(true), 100);
+      // Native controls are user input too. Publish immediately: waiting for a
+      // getter here let a periodic sync restart a genuinely paused host player.
+      handleNativePlayback(false, event);
     });
     instance.bind(events.SEEK, (event) => {
       if (!valid()) return;
       lastPosition = event.currentPosition || 0;
       lastPositionAt = performance.now();
-      if (eventsAllowed()) send({ type: 'control', action: 'seek', positionMs: lastPosition });
-      else if (!isHost() && performance.now() > ignoreEventsUntil) setTimeout(() => reconcile(true), 100);
+      if (consumeWidgetEvent('SEEK', lastPosition)) return;
+      if (eventsAllowed() && Math.abs(lastPosition - targetPosition()) > 250) hostIntent('seek', lastPosition, false);
+      else if (!isHost()) setTimeout(() => reconcile(true), 100);
     });
     instance.bind(events.FINISH, () => {
       if (valid() && isHost() && connected && !waitingLocally && room?.playback.playing) send({ type: 'control', action: 'skip' });
@@ -483,6 +577,8 @@ function loadTrack(track) {
     instance.bind(events.ERROR, () => {
       if (!valid()) return;
       playerUnavailable = true;
+      invalidateReconcile();
+      renderControls();
       errorAt('player-error', 'SoundCloud couldn’t play this track here. It may be restricted or embedding may be disabled. The host can skip it.');
       setSync('Track unavailable on this device', true);
     });
@@ -492,6 +588,7 @@ function loadTrack(track) {
     if (generation === loadGeneration && !playerReady) {
       errorAt('player-error', 'Still waiting for SoundCloud. Try another track, or check that your browser allows the embedded player.');
       setSync('Waiting for SoundCloud', true);
+      renderControls();
     }
   }, 18000);
 }
@@ -499,12 +596,13 @@ function reconcile(force = false) {
   // The requester finishes their ad locally. Widget events cannot identify ads,
   // so no seek/pause/play commands are sent until they explicitly mark ready.
   if (waitingLocally) { setSync('Finish your ad, then choose “I’m ready”', true); return; }
+  if (nativeCheck) return;
   if (!widget || !playerReady || !connected || !currentTrack() || playerUnavailable) return;
   if (syncing) { pendingForce ||= force; return; }
-  const instance = widget, generation = loadGeneration, attempt = ++syncAttempt;
+  const instance = widget, generation = loadGeneration, attempt = ++syncAttempt, serial = intentSerial;
   let active = true;
   syncing = true;
-  const valid = () => active && connected && !waitingLocally && generation === loadGeneration && instance === widget && attempt === syncAttempt;
+  const valid = () => active && connected && !waitingLocally && generation === loadGeneration && instance === widget && attempt === syncAttempt && serial === intentSerial;
   const finish = () => {
     if (!valid()) return;
     active = false;
@@ -518,20 +616,20 @@ function reconcile(force = false) {
     if (!valid()) return;
     instance.isPaused((paused) => {
       if (!valid()) return;
-      const drift = targetPosition() - position;
-      if ((force && Math.abs(drift) > 250) || (Math.abs(drift) > 1100 && performance.now() - lastCorrection > 4500)) {
-        suppressEvents();
-        instance.seekTo(targetPosition());
-        lastCorrection = performance.now();
-      }
-      if (room.playback.playing && audioEnabled && paused) { suppressEvents(); instance.play(); }
-      else if (!room.playback.playing && !paused) { suppressEvents(); instance.pause(); }
       lastPosition = position;
       lastPositionAt = performance.now();
       lastWidgetPlaying = !paused;
+      const drift = targetPosition() - position;
+      if ((force && Math.abs(drift) > 250) || (Math.abs(drift) > 1100 && performance.now() - lastCorrection > 4500)) {
+        commandSeek(targetPosition());
+        lastCorrection = performance.now();
+      }
+      const playing = playbackState().playing;
+      if (playing && audioEnabled && paused) commandPlayback(true);
+      else if (!playing && !paused) commandPlayback(false);
       if (!audioEnabled) setSync('Tap “Enable listening” to hear the room', true);
-      else if (room.playback.playing && paused) setSync('Starting playback');
-      else setSync(room.playback.playing ? 'Following the room' : 'Together, on pause');
+      else if (playing && paused) setSync('Starting playback');
+      else setSync(playing ? 'Listening together' : 'Paused');
       finish();
     });
   });
@@ -543,7 +641,7 @@ function time(ms) {
 setInterval(() => {
   if (!room) return;
   const duration = knownDuration || currentTrack()?.duration || 0;
-  const estimate = room.playback.playing && lastWidgetPlaying ? lastPosition + Math.max(0, performance.now() - lastPositionAt) : lastPosition;
+  const estimate = playbackState().playing && lastWidgetPlaying ? lastPosition + Math.max(0, performance.now() - lastPositionAt) : lastPosition;
   $('elapsed').textContent = time(Math.min(duration || Infinity, estimate));
   $('duration').textContent = time(duration);
   if (document.activeElement !== $('seek')) $('seek').value = duration ? Math.round(estimate / duration * 1000) : 0;
@@ -552,7 +650,7 @@ setInterval(() => reconcile(), 2500);
 // Server time remains authoritative. Host reports are deliberately infrequent and
 // only correct real buffering stalls, rather than moving the room every frame.
 heartbeatTimer = setInterval(() => {
-  if (!isHost() || !connected || !playerReady || !audioEnabled || waitingLocally || syncing || playerUnavailable || !room.playback.playing || !lastWidgetPlaying || performance.now() < ignoreEventsUntil) return;
+  if (!isHost() || !connected || !playerReady || !audioEnabled || waitingLocally || syncing || pendingIntent || playerUnavailable || !room.playback.playing || !lastWidgetPlaying) return;
   const instance = widget, trackId = loadedTrackId, baseRevision = room.revision;
   instance.getPosition((position) => {
     if (instance !== widget || trackId !== room?.currentTrackId || baseRevision !== room?.revision) return;
@@ -611,28 +709,38 @@ $('invite-button').addEventListener('click', async () => {
   catch { window.prompt('Copy this room link:', invite); }
 });
 $('play-button').addEventListener('click', () => {
-  if (!isHost() || !currentTrack()) return;
+  if (!isHost() || !currentTrack() || !playerReady || !connected || playerUnavailable || waitingLocally) return;
   audioEnabled = true;
   $('enable-audio').hidden = true;
-  if (widget && playerReady) {
-    suppressEvents();
-    if (!room.playback.playing) widget.play(); else widget.pause();
-  }
-  send({ type: 'control', action: room.playback.playing ? 'pause' : 'play', positionMs: room.playback.playing ? lastPosition : targetPosition() });
+  const playing = playbackState().playing;
+  hostIntent(playing ? 'pause' : 'play', playing ? lastPosition : targetPosition());
 });
-$('skip-button').addEventListener('click', () => send({ type: 'control', action: 'skip' }));
-$('seek').addEventListener('change', () => send({ type: 'control', action: 'seek', positionMs: Number($('seek').value) / 1000 * knownDuration }));
+$('skip-button').addEventListener('click', () => {
+  if ($('skip-button').disabled) return;
+  clearIntent();
+  invalidateReconcile();
+  commandPlayback(false);
+  send({ type: 'control', action: 'skip' });
+});
+$('seek').addEventListener('change', () => {
+  if ($('seek').disabled) return;
+  hostIntent('seek', Number($('seek').value) / 1000 * knownDuration);
+});
 $('enable-audio').addEventListener('click', () => {
+  if (!playerReady || !widget || !connected || playerUnavailable) return;
   audioEnabled = true;
   $('enable-audio').hidden = true;
-  if (!playerReady || !widget) { toast('The player is still loading. Playback will follow when it’s ready.'); return; }
-  suppressEvents();
-  if (room.playback.playing) { widget.seekTo(targetPosition()); widget.play(); }
-  else if (isHost()) { widget.play(); send({ type: 'control', action: 'play', positionMs: targetPosition() }); }
+  if (playbackState().playing) { commandSeek(targetPosition()); commandPlayback(true); }
+  else if (isHost()) hostIntent('play', targetPosition());
   else toast('You’re ready. Playback starts when the host presses play.');
   reconcile(true);
 });
-$('resync-button').addEventListener('click', () => { lastCorrection = 0; reconcile(true); toast('Catching up to the room.'); });
+$('resync-button').addEventListener('click', () => {
+  if ($('resync-button').disabled || $('resync-button').hidden) return;
+  lastCorrection = 0;
+  reconcile(true);
+  toast('Catching up to the room.');
+});
 $('volume').addEventListener('input', () => {
   volume = Math.max(0, Math.min(100, Number($('volume').value) || 0));
   if (volume > 0) unmutedVolume = volume;
@@ -652,6 +760,7 @@ $('wait-button').addEventListener('click', () => {
     reconcile(true);
   } else {
     waitingLocally = true;
+    clearIntent();
     syncing = false;
     pendingForce = false;
     syncAttempt++;
@@ -663,12 +772,9 @@ $('wait-button').addEventListener('click', () => {
 $('import-playlist-button').addEventListener('click', () => {
   if (!playlistTracks.length) return;
   if (send({ type: 'add_many', tracks: playlistTracks })) { closePlaylist(); toast('Playlist sent to the queue.'); }
+  else toast('Reconnect to the room before importing.');
 });
 $('cancel-playlist-button').addEventListener('click', closePlaylist);
-$('links-toggle').addEventListener('click', () => {
-  $('links-panel').hidden = !$('links-panel').hidden;
-  $('links-toggle').setAttribute('aria-expanded', String(!$('links-panel').hidden));
-});
 function leaveRoom() {
   stopped = true;
   clearTimeout(reconnectTimer);
@@ -695,7 +801,6 @@ $('leave-room').addEventListener('click', leaveRoom);
 $('join-back').addEventListener('click', leaveRoom);
 applyVolume();
 applyTheme(storage.get('theme') || (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
-loadLinks();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { send({ type: 'ping', sentAt: Date.now() }); reconcile(true); } });
 window.addEventListener('beforeunload', () => { stopped = true; clearInterval(heartbeatTimer); socket?.close(); });
 

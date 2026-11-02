@@ -32,7 +32,15 @@ Use full URLs such as `https://soundcloud.com/artist/track` or `https://soundclo
 
 Playlist import uses the Widget API's `getSounds` result and adds individual public tracks. Duplicate tracks are omitted, and the shared queue holds at most 100 tracks. The preview may expose only part of a large playlist; restricted or unavailable tracks can still fail during playback.
 
-Volume and mute affect only your audio. Volume and the light/dark preference are saved in your browser. The page also keeps creation, invites, listeners, the queue, and help together. Optional source/social links stay hidden until configured. Add HTTPS links to `public/links.json` as an array of objects with `label` and `url` fields; they expand within the same page.
+Volume and mute affect only your audio. Volume and the light/dark preference are saved in your browser. The page keeps creation, invites, listeners, the queue, and help together. Footer links open GitHub and the support page in another tab so they do not interrupt a jam.
+
+The support page reads its donation destination from `public/support.json`. Its current destination is [Buy Me a Coffee](https://buymeacoffee.com/bwaeden). Set `url` to another HTTPS recipient URL to change providers, or `null` to hide checkout while retaining the GitHub support option.
+
+## Interface and playback controls
+
+The layout follows the restrained hierarchy of [Linear's interface refresh](https://linear.app/now/behind-the-latest-design-refresh) and the focused controls of [Apple Music MiniPlayer](https://support.apple.com/guide/music-web-review/use-music-miniplayer-apdm333a63ec/web). Icons use a consistent local SVG set based on [Lucide's design principles](https://lucide.dev/contribute/icons/design-principles); no icon fonts, external icon scripts, or text characters are used for transport controls. Lucide and Feather notices are included in `public/icons.LICENSE.txt`.
+
+Shared playback controls are enabled after SoundCloud reports that the player is ready. Host actions from either the site's controls or the SoundCloud embed are sent through the same playback flow. A local action takes effect immediately and remains pending until the server confirms it; older asynchronous position callbacks cannot undo a newer pause or seek. Guest volume remains personal, and guests follow the host's shared playback.
 
 If the host disconnects, their role is reserved for 15 seconds before passing to a connected listener. Invite links have no password: anyone with the link can join and add music.
 

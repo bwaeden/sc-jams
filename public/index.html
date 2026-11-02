@@ -3,40 +3,77 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f2f3f4">
-  <meta name="description" content="Create a room. Send the link. Listen to SoundCloud together.">
+  <meta name="theme-color" content="#f7f8fa">
+  <meta name="description" content="Create a room, share a link, and listen to SoundCloud together.">
   <title>sc jams</title>
   <script src="/theme.js"></script>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
+  <script src="/icons.js" defer></script>
   <script src="https://w.soundcloud.com/player/api.js" defer></script>
   <script src="/app.js" type="module"></script>
 </head>
 <body>
-  <main class="app-shell">
-    <header class="app-header"><span class="brand">sc jams<span class="brand-dot" aria-hidden="true"></span></span><button id="theme-toggle" class="icon-button theme-toggle" type="button" aria-label="Switch color theme" aria-pressed="false" title="Switch color theme">◐</button></header>
-    <section id="landing" class="landing" aria-labelledby="start-title">
-      <h1 id="start-title">Listen together.</h1><p class="muted">Create a room and send the link to your friends.</p>
-      <form id="create-form" class="create-form"><label class="sr-only" for="create-name">Your name, optional</label><input id="create-name" name="name" maxlength="24" autocomplete="nickname" placeholder="Your name (optional)"><input id="first-track" name="track" type="hidden" value=""><button class="button primary" id="create-button" type="submit">Create room <span aria-hidden="true">↗</span></button></form>
-      <p id="create-error" class="inline-error" role="alert" hidden></p><button id="show-join" class="text-button join-toggle" type="button">Have a room link?</button>
-      <form id="join-code-form" class="join-code-form" hidden><label class="sr-only" for="room-link">Room link or code</label><div class="input-row"><input id="room-link" required placeholder="Paste a room link"><button class="button secondary" type="submit">Join</button></div></form>
-    </section>
-    <section id="join-overlay" class="join-section" aria-labelledby="join-title" hidden><h1 id="join-title">Join the room.</h1><form id="join-form" class="create-form"><label class="sr-only" for="join-name">Your name, optional</label><input id="join-name" maxlength="24" autocomplete="nickname" placeholder="Your name (optional)"><button class="button primary" type="submit">Join & listen <span aria-hidden="true">↗</span></button></form><p id="join-error" class="inline-error" role="alert" hidden></p><button id="join-back" class="text-button join-toggle" type="button">Create a different room</button></section>
-    <section id="room-view" class="room-view" aria-label="Listening room" hidden>
-      <div class="room-heading"><div class="room-identity"><span id="connection" class="connection"><i></i>Connecting</span><p id="room-subtitle" class="room-code"></p></div><div class="room-actions"><button class="button secondary small" id="invite-button" type="button">Copy invite ↗</button><button id="leave-room" class="text-button" type="button">Leave</button></div></div>
-      <section class="player" aria-label="Shared playback">
-        <div id="empty-player" class="empty-player"><p>Add a track or a playlist to get started.</p></div>
-        <div id="active-player" class="active-player" hidden><div class="track-heading"><div><p id="track-artist" class="muted">SoundCloud</p><h2 id="track-title">Loading track…</h2></div><a id="track-link" class="quiet-link" href="https://soundcloud.com" target="_blank" rel="noopener noreferrer" aria-label="Open track on SoundCloud">↗</a></div><div id="embed-container" class="embed-container"></div><p id="player-error" class="inline-error" role="alert" hidden></p><button id="enable-audio" class="button secondary enable-audio" type="button" hidden>Enable listening</button></div>
-        <div class="transport"><div class="transport-buttons"><button id="play-button" class="play-button icon-button" type="button" aria-label="Play shared track" disabled><span id="play-icon" aria-hidden="true">▶</span></button><button id="skip-button" class="icon-button" type="button" aria-label="Next track" disabled>↦</button></div><div class="timeline"><input id="seek" type="range" min="0" max="1000" value="0" aria-label="Shared playback position" disabled><div class="time-labels"><span id="elapsed">0:00</span><span id="duration">0:00</span></div></div><div class="volume-control"><button id="mute-button" class="icon-button" type="button" aria-label="Mute your audio" aria-pressed="false" title="Mute your audio"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/></svg></button><label class="sr-only" for="volume">Your volume</label><input id="volume" type="range" min="0" max="100" value="70" aria-label="Your volume"><output id="volume-value" for="volume">70%</output></div></div>
-        <div class="playback-details"><span id="playback-label" class="player-status">Ready</span><span id="role-hint" class="role-hint">The host controls playback.</span></div>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><svg data-icon="audio-lines"></svg></span><span>sc jams</span></div>
+      <button id="theme-toggle" class="icon-button" type="button" aria-label="Switch to dark mode" aria-pressed="false" title="Switch color theme"><svg data-icon="moon" aria-hidden="true"></svg></button>
+    </header>
+    <main>
+      <section id="landing" class="landing" aria-labelledby="start-title">
+        <div class="entry-heading"><h1 id="start-title">Listen together.</h1><p>Create a room. Share the link. Press play.</p></div>
+        <form id="create-form" class="entry-form">
+          <label for="create-name">Your name <span class="optional">optional</span></label>
+          <input id="create-name" name="name" maxlength="24" autocomplete="nickname" placeholder="What should we call you?">
+          <input id="first-track" name="track" type="hidden" value="">
+          <button class="button primary" id="create-button" type="submit"><svg data-icon="plus" aria-hidden="true"></svg><span>Create room</span></button>
+        </form>
+        <p id="create-error" class="inline-error" role="alert" hidden></p>
+        <button id="show-join" class="text-button join-toggle" type="button">Already have a room link?</button>
+        <form id="join-code-form" class="join-code-form" hidden><label for="room-link">Room link or code</label><div class="input-row"><input id="room-link" required placeholder="Paste your invite link"><button class="button secondary" type="submit">Join room</button></div></form>
       </section>
-      <div class="listening-strip"><span id="sync-indicator" class="sync-indicator"><i></i>Ready</span><div class="listening-actions"><button id="wait-button" class="text-button" type="button" title="Pause the room while you catch up" disabled>Wait for me</button><button id="resync-button" class="text-button" type="button" hidden>Resync</button></div></div>
-      <section class="listeners" aria-label="Listeners"><span class="listeners-label">Listening <span id="people-count">0</span></span><ul id="people" class="people"></ul></section>
-      <section class="queue-section" aria-labelledby="queue-title"><div class="section-heading"><h2 id="queue-title">Queue <span id="queue-count">0</span></h2></div><form id="add-form"><label class="sr-only" for="track-url">SoundCloud track or playlist link</label><div class="add-input-wrap"><input id="track-url" type="url" required placeholder="Paste a SoundCloud track or playlist link" autocomplete="off"><button id="add-button" class="add-button" type="submit" aria-label="Add to queue">+</button></div></form><p id="queue-error" class="inline-error" role="alert" hidden></p><section id="playlist-import" class="playlist-import" aria-label="Import playlist" hidden><div id="playlist-preview" class="embed-container"></div><p id="import-status" class="muted" role="status">Loading playlist…</p><div class="import-actions"><button id="import-playlist-button" class="button secondary small" type="button" disabled>Add playlist</button><button id="cancel-playlist-button" class="text-button" type="button">Cancel</button></div></section><ol id="queue" class="queue"></ol><p id="empty-queue" class="empty-queue">The queue is empty.</p></section>
-    </section>
-    <footer class="app-footer"><details id="help-details"><summary>Help</summary><div class="help-content"><p>Use full, public SoundCloud track or playlist links. Anyone can add music; the host controls playback. Volume changes only your audio.</p><p>Ads can differ between listeners. Choose “Wait for me” to pause the room while your ad finishes locally. Then choose “I’m ready”; the host resumes when everyone is ready. Automatic ad detection isn’t available.</p><p>This is an independent experiment. SoundCloud controls playback and availability.</p></div></details><button id="links-toggle" class="text-button" type="button" hidden aria-expanded="false" aria-controls="links-panel">Source & links ↗</button></footer>
-    <div id="links-panel" class="links-panel muted" hidden></div>
-  </main>
+      <section id="join-overlay" class="landing join-section" aria-labelledby="join-title" hidden>
+        <div class="entry-heading"><h1 id="join-title">You're invited.</h1><p>Your friends are one click away.</p></div>
+        <form id="join-form" class="entry-form"><label for="join-name">Your name <span class="optional">optional</span></label><input id="join-name" maxlength="24" autocomplete="nickname" placeholder="What should we call you?"><button class="button primary" type="submit"><svg data-icon="headphones" aria-hidden="true"></svg><span>Join room</span></button></form>
+        <p id="join-error" class="inline-error" role="alert" hidden></p>
+        <button id="join-back" class="text-button join-toggle" type="button"><svg data-icon="arrow-left" aria-hidden="true"></svg><span>Create a different room</span></button>
+      </section>
+      <section id="room-view" class="room-view" aria-label="Listening room" hidden>
+        <div class="room-heading">
+          <div class="room-identity"><div class="room-title-row"><h1>Your room</h1><span id="connection" class="connection"><i></i>Connecting</span></div><p id="room-subtitle" class="room-code"></p></div>
+          <div class="room-actions"><button class="button secondary" id="invite-button" type="button"><svg data-icon="copy" aria-hidden="true"></svg><span>Copy invite</span></button><button id="leave-room" class="icon-button" type="button" aria-label="Leave room" title="Leave room"><svg data-icon="log-out" aria-hidden="true"></svg></button></div>
+        </div>
+        <section class="player panel" aria-labelledby="player-section-title">
+          <div class="section-heading player-section-heading"><h2 id="player-section-title">Now playing</h2><div class="player-heading-actions"><a id="track-link" class="icon-button track-source" href="https://soundcloud.com" target="_blank" rel="noopener noreferrer" aria-label="Open track on SoundCloud" title="Open track on SoundCloud" hidden><svg data-icon="external-link" aria-hidden="true"></svg></a><span id="playback-label" class="player-status">Ready</span></div></div>
+          <div id="empty-player" class="empty-player"><span class="empty-icon" aria-hidden="true"><svg data-icon="headphones"></svg></span><p>Your room is ready.</p><span>Add a SoundCloud track or playlist below.</span></div>
+          <div id="active-player" class="active-player" hidden>
+            <div class="sr-only"><p id="track-artist">SoundCloud</p><h3 id="track-title">Loading track</h3></div>
+            <div id="embed-container" class="embed-container"></div>
+            <p id="player-error" class="inline-error" role="alert" hidden></p>
+            <button id="enable-audio" class="button secondary enable-audio" type="button" hidden><svg data-icon="headphones" aria-hidden="true"></svg><span>Enable listening</span></button>
+          </div>
+          <div class="transport">
+            <div class="transport-buttons"><button id="play-button" class="play-button icon-button" type="button" aria-label="Play shared track" title="Play shared track" disabled><span id="play-icon" aria-hidden="true"><svg data-icon="play"></svg></span></button><button id="skip-button" class="icon-button" type="button" aria-label="Next track" title="Next track" disabled><svg data-icon="skip-forward" aria-hidden="true"></svg></button></div>
+            <div class="timeline"><span id="elapsed">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" aria-label="Shared playback position" disabled><span id="duration">0:00</span></div>
+            <div class="volume-control"><button id="mute-button" class="icon-button" type="button" aria-label="Mute your audio" aria-pressed="false" title="Mute your audio"><svg data-icon="volume-2" aria-hidden="true"></svg></button><label class="sr-only" for="volume">Your volume</label><input id="volume" type="range" min="0" max="100" value="70" aria-label="Your volume"><output id="volume-value" for="volume" class="sr-only">70%</output></div>
+          </div>
+          <div class="player-caption"><span id="sync-indicator" class="sync-indicator"><i></i>Ready</span><span id="role-hint" class="role-hint">The host controls playback.</span></div>
+        </section>
+        <div class="room-meta"><section class="listeners" aria-label="Listeners"><span class="listeners-label"><svg data-icon="users" aria-hidden="true"></svg><span id="people-count">0</span></span><ul id="people" class="people"></ul></section><div class="listening-actions"><button id="wait-button" class="text-button" type="button" title="Pause the room while you catch up" disabled>Wait for me</button><button id="resync-button" class="text-button" type="button" hidden><svg data-icon="rotate-cw" aria-hidden="true"></svg><span>Resync</span></button></div></div>
+        <section class="queue-section panel" aria-labelledby="queue-title">
+          <div class="section-heading"><h2 id="queue-title">Queue <span id="queue-count">0</span></h2><span class="section-note">Everyone can add music</span></div>
+          <form id="add-form"><label class="sr-only" for="track-url">SoundCloud track or playlist link</label><div class="add-input-wrap"><span class="input-icon" aria-hidden="true"><svg data-icon="link"></svg></span><input id="track-url" type="url" required placeholder="Paste a SoundCloud track or playlist link" autocomplete="off"><button id="add-button" class="button secondary" type="submit"><svg data-icon="plus" aria-hidden="true"></svg><span>Add</span></button></div></form>
+          <p id="queue-error" class="inline-error" role="alert" hidden></p>
+          <section id="playlist-import" class="playlist-import" aria-label="Import playlist" hidden><div id="playlist-preview" class="embed-container"></div><p id="import-status" class="muted" role="status">Loading playlist</p><div class="import-actions"><button id="import-playlist-button" class="button secondary" type="button" disabled>Add playlist</button><button id="cancel-playlist-button" class="text-button" type="button">Cancel</button></div></section>
+          <ol id="queue" class="queue"></ol><div id="empty-queue" class="empty-queue"><p>No tracks yet.</p><span>Add one you think your friends should hear.</span></div>
+        </section>
+      </section>
+    </main>
+    <footer class="app-footer">
+      <details id="help-details"><summary>How it works</summary><div class="help-content"><p>Paste a public SoundCloud track or playlist link. Anyone can add music; the host controls shared playback. Volume is just for you.</p><p>If you get an ad, choose “Wait for me.” Finish the ad, choose “I'm ready,” then let the host resume. Ad detection is manual.</p><p>sc jams is independent of SoundCloud. Playback and availability are provided by SoundCloud.</p></div></details>
+      <nav class="footer-links" aria-label="Project links"><a href="https://github.com/bwaeden/sc-jams" target="_blank" rel="noopener noreferrer" class="footer-link" title="View sc jams on GitHub"><svg data-icon="github" aria-hidden="true"></svg><span>GitHub</span></a><a href="/support.html" target="_blank" rel="noopener noreferrer" class="footer-link coffee-link"><svg data-icon="coffee" aria-hidden="true"></svg><span>Buy me a coffee</span></a></nav>
+    </footer>
+  </div>
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

@@ -9,9 +9,9 @@ const EVENTS = Object.fromEntries(['READY', 'PLAY_PROGRESS', 'PLAY', 'PAUSE', 'S
 
 // This deliberately leaves widget getters pending. SoundCloud's iframe API is
 // asynchronous, so track changes and server updates can arrive before a getter.
-function browser({ saved = {} } = {}) {
+function browser({ saved = {}, asyncEvents = false, responses = {} } = {}) {
   let timestamp = 1_800_000_000_000, monotonic = 10_000, timerId = 0;
-  const intervals = [], timeouts = new Map(), elements = new Map(), widgets = [], sockets = [], messages = [];
+  const intervals = [], timeouts = new Map(), elements = new Map(), widgets = [], sockets = [], messages = [], widgetEvents = [], requests = [], clipboard = [];
   class Element {
     constructor(tag = 'div') {
       this.tagName = tag;
@@ -40,7 +40,7 @@ function browser({ saved = {} } = {}) {
   function Widget(iframe) {
     const callbacks = new Map();
     const instance = {
-      iframe, callbacks, pendingPositions: [], pendingSounds: [], calls: [], paused: true, volume: 100,
+      iframe, callbacks, pendingPositions: [], pendingPaused: [], pendingSounds: [], calls: [], paused: true, volume: 100, deferPaused: false,
       bind(event, callback) { callbacks.set(event, callback); },
       emit(event, payload = {}) { callbacks.get(event)?.(payload); },
       getPosition(callback) { this.pendingPositions.push(callback); },
@@ -49,7 +49,8 @@ function browser({ saved = {} } = {}) {
         assert.ok(callback, 'the client must have requested the widget position');
         callback(position);
       },
-      isPaused(callback) { callback(this.paused); },
+      isPaused(callback) { if (this.deferPaused) this.pendingPaused.push(callback); else callback(this.paused); },
+      resolvePaused(paused = this.paused) { const callback = this.pendingPaused.shift(); assert.ok(callback); callback(paused); },
       getDuration(callback) { callback(240000); },
       getCurrentSound(callback) { callback({ title: 'Test track', user: { username: 'Test artist' }, duration: 240000 }); },
       getSounds(callback) { this.pendingSounds.push(callback); },
@@ -59,9 +60,10 @@ function browser({ saved = {} } = {}) {
         callback(sounds);
       },
       setVolume(value) { this.volume = value; this.calls.push({ method: 'setVolume', volume: value }); },
-      seekTo(position) { this.calls.push({ method: 'seekTo', position }); this.emit(EVENTS.SEEK, { currentPosition: position }); },
-      play() { this.calls.push({ method: 'play' }); this.paused = false; this.emit(EVENTS.PLAY); },
-      pause() { this.calls.push({ method: 'pause' }); this.paused = true; this.emit(EVENTS.PAUSE); },
+      dispatch(event, payload = {}) { if (asyncEvents) widgetEvents.push(() => this.emit(event, payload)); else this.emit(event, payload); },
+      seekTo(position) { this.calls.push({ method: 'seekTo', position }); this.dispatch(EVENTS.SEEK, { currentPosition: position }); },
+      play() { this.calls.push({ method: 'play' }); this.paused = false; this.dispatch(EVENTS.PLAY); },
+      pause() { this.calls.push({ method: 'pause' }); this.paused = true; this.dispatch(EVENTS.PAUSE); },
     };
     widgets.push(instance);
     return instance;
@@ -88,7 +90,13 @@ function browser({ saved = {} } = {}) {
     localStorage, sessionStorage: storage(),
     location: { protocol: 'http:', origin: 'http://localhost:3000', host: 'localhost:3000', pathname: '/' },
     history: { replaceState() {} },
-    navigator: {},
+    navigator: { clipboard: { writeText: async (value) => clipboard.push(value) } },
+    fetch: async (url, options = {}) => {
+      requests.push({ url, options });
+      const result = responses[url];
+      if (!result) return { ok: false, json: async () => ({}) };
+      return { ok: result.ok ?? true, json: async () => result.body ?? result };
+    },
     window: { SC: { Widget }, addEventListener() {} },
     WebSocket: Socket,
     setTimeout(callback, ms) { const id = ++timerId; timeouts.set(id, { callback, ms }); return id; },
@@ -106,14 +114,16 @@ function browser({ saved = {} } = {}) {
         if ('clockOffset' in next) clockOffset = next.clockOffset;
         if ('socket' in next) socket = next.socket;
       },
-      status() { return { syncing, loadedTrackId, loadGeneration, playerReady, ignoreEventsUntil, volume, waitingLocally, playlistTracks }; }
+      status() { return { syncing, loadedTrackId, loadGeneration, playerReady, pendingIntent, volume, waitingLocally, playlistTracks }; }
     };
   `, context, { filename: 'app.js' });
   const app = context.__appTest;
   app.configure({ connected: true, audioEnabled: true,
     socket: { readyState: 1, send: (raw) => messages.push(JSON.parse(raw)) } });
   return {
-    app, widgets, sockets, messages, element, localStorage, root,
+    app, widgets, sockets, messages, element, localStorage, root, requests, clipboard,
+    flushWidgetEvents() { while (widgetEvents.length) widgetEvents.shift()(); },
+    discardWidgetEvents() { widgetEvents.length = 0; },
     event(id, type, payload = { preventDefault() {} }) {
       const callback = element(id).listeners.get(type);
       assert.ok(callback, `expected ${type} handler for ${id}`);
@@ -250,18 +260,18 @@ test('a forced correction requested during an existing getter is retained', () =
   assert.equal(b.app.status().syncing, false);
 });
 
-test('a delayed native pause sample cannot pause a newer host timeline', () => {
+test('native host pause publishes immediately without waiting for a position getter', () => {
   const b = browser();
   const widget = load(b, room(b, { host: true, revision: 10 }));
   widget.paused = false;
   widget.resolvePosition(10000);
   b.advance(2000);
-  widget.emit(EVENTS.PAUSE);
-  assert.equal(widget.pendingPositions.length, 1);
-  b.app.configure({ room: room(b, { host: true, revision: 11, position: 80000 }) });
-  b.advance(2000);
-  widget.resolvePosition(12000);
-  assert.equal(b.messages.filter((message) => message.type === 'control' && message.action === 'pause').length, 0);
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE, { currentPosition: 12000 });
+  assert.equal(widget.pendingPositions.length, 0, 'native pause must not await another iframe getter');
+  const pause = b.messages.find((message) => message.type === 'control' && message.action === 'pause');
+  assert.equal(pause?.positionMs, 12000);
+  assert.equal(b.element('play-button')['aria-label'], 'Play shared track');
 });
 
 test('a pending widget getter cannot restart playback after the socket closes', () => {
@@ -361,6 +371,20 @@ test('playlist import validates and deduplicates tracks and respects remaining q
   assert.equal(b.element('playlist-import').hidden, true);
 });
 
+test('playlist import becomes unavailable when the room disconnects', () => {
+  const b = browser();
+  b.app.connect();
+  b.app.configure({ room: room(b) });
+  b.app.previewPlaylist('https://soundcloud.com/artist/sets/a-playlist');
+  const preview = b.widgets.at(-1);
+  preview.emit(EVENTS.READY);
+  preview.resolveSounds([{ permalink_url: 'https://soundcloud.com/artist/new-track', title: 'New track' }]);
+  assert.equal(b.element('import-playlist-button').disabled, false);
+  b.sockets[0].emit('close', { code: 1006 });
+  assert.equal(b.element('import-playlist-button').disabled, true);
+  assert.equal(b.messages.filter((message) => message.type === 'add_many').length, 0);
+});
+
 test('canceling a playlist ignores its late metadata callback and cannot import it', () => {
   const b = browser();
   b.app.configure({ room: room(b) });
@@ -405,4 +429,185 @@ test('a listener waiting through an ad receives no player corrections until read
   widget.resolvePosition(10000);
   assert.ok(widget.calls.some((call) => call.method === 'play'), 'host resume starts the ready listener');
   assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
+});
+
+test('site pause stops the widget immediately and invalidates an older sync getter', () => {
+  const b = browser({ asyncEvents: true });
+  const widget = load(b, room(b, { host: true }));
+  widget.paused = false;
+  widget.resolvePosition(10000);
+  b.app.reconcile();
+  assert.equal(widget.pendingPositions.length, 1);
+  b.messages.length = 0;
+  b.event('play-button', 'click');
+  assert.equal(widget.paused, true, 'the pause button must stop local audio before the server round trip');
+  assert.equal(b.element('play-button')['aria-label'], 'Play shared track');
+  widget.resolvePosition(5000); // Old getter must not restart playback.
+  b.flushWidgetEvents();
+  assert.equal(widget.calls.filter((call) => call.method === 'play').length, 0);
+  assert.equal(b.messages.filter((message) => message.action === 'pause').length, 1);
+  assert.equal(b.messages.filter((message) => message.action === 'play').length, 0);
+});
+
+test('a real embed pause immediately after programmatic play is not swallowed', () => {
+  const b = browser({ asyncEvents: true });
+  const widget = load(b, room(b, { host: true }));
+  widget.resolvePosition(0); // Issues seek and play; their echoes are still queued.
+  assert.equal(widget.paused, false);
+  b.messages.length = 0;
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE, { currentPosition: 10300 });
+  assert.equal(b.messages.filter((message) => message.action === 'pause').length, 1);
+  assert.equal(b.app.status().pendingIntent.playing, false);
+  b.flushWidgetEvents(); // Delayed old PLAY must not overturn the user's pause.
+  assert.equal(b.messages.filter((message) => message.action === 'play').length, 0);
+  b.app.reconcile();
+  widget.resolvePosition(10300);
+  assert.equal(widget.paused, true);
+  assert.equal(b.element('play-button')['aria-label'], 'Play shared track');
+});
+
+test('rapid site play then pause keeps the latest intent through out-of-order acknowledgments', () => {
+  const b = browser({ asyncEvents: true });
+  b.app.connect();
+  const widget = load(b, room(b, { host: true, playing: false }));
+  widget.resolvePosition(10000);
+  b.messages.length = 0;
+  b.event('play-button', 'click');
+  b.event('play-button', 'click');
+  assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['play', 'pause']);
+  assert.equal(widget.paused, true);
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'state', serverTime: b.now(), room: room(b, { host: true, playing: true, revision: 2 }) }) });
+  widget.resolvePosition(10000);
+  assert.equal(widget.paused, true, 'an older play acknowledgment cannot restart the paused widget');
+  assert.equal(b.app.status().pendingIntent.playing, false);
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'state', serverTime: b.now(), room: room(b, { host: true, playing: false, revision: 3 }) }) });
+  widget.resolvePosition(10000);
+  b.flushWidgetEvents();
+  assert.equal(b.app.status().pendingIntent, null);
+  assert.equal(b.app.status().syncing, false);
+  assert.equal(widget.paused, true);
+});
+
+test('native embed play updates the site immediately and old pause echoes stay local', () => {
+  const b = browser({ asyncEvents: true });
+  const widget = load(b, room(b, { host: true, playing: false }));
+  widget.paused = false;
+  widget.resolvePosition(10000); // Server state requests pause, echo pending.
+  assert.equal(widget.paused, true);
+  b.messages.length = 0;
+  widget.paused = false;
+  widget.emit(EVENTS.PLAY, { currentPosition: 10000 });
+  assert.equal(b.messages.filter((message) => message.action === 'play').length, 1);
+  assert.equal(b.element('play-button')['aria-label'], 'Pause shared track');
+  b.flushWidgetEvents();
+  assert.equal(b.messages.filter((message) => message.action === 'pause').length, 0);
+});
+
+test('shared playback controls wait for widget READY and unavailable widgets remain disabled', () => {
+  const b = browser();
+  const state = room(b, { host: true });
+  b.app.configure({ room: state });
+  b.app.loadTrack(state.queue[0]);
+  assert.equal(b.element('play-button').disabled, true);
+  b.event('play-button', 'click');
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
+  const widget = b.widgets.at(-1);
+  widget.emit(EVENTS.READY);
+  widget.resolvePosition(10000);
+  assert.equal(b.element('play-button').disabled, false);
+  widget.emit(EVENTS.ERROR);
+  assert.equal(b.element('play-button').disabled, true);
+  assert.equal(b.element('resync-button').disabled, true);
+});
+
+test('create, invite copy and leave execute their visible actions', async () => {
+  const b = browser({ responses: { '/api/rooms': { body: { roomId: 'newRoom123456' } } } });
+  b.element('create-name').value = 'Alex';
+  await b.event('create-form', 'submit');
+  assert.equal(b.requests.find((request) => request.url === '/api/rooms').options.method, 'POST');
+  b.sockets[0].emit('open');
+  const join = b.messages.find((message) => message.type === 'join');
+  assert.equal(join.roomId, 'newRoom123456');
+  assert.equal(join.name, 'Alex');
+  await b.event('invite-button', 'click');
+  assert.equal(b.clipboard[0], 'http://localhost:3000/room/newRoom123456');
+  b.event('leave-room', 'click');
+  assert.equal(b.sockets[0].readyState, 3);
+  assert.equal(b.element('landing').hidden, false);
+  assert.equal(b.element('room-view').hidden, true);
+});
+
+test('join link, back, queue add, select, remove, skip and seek have functional handlers', async () => {
+  const b = browser({ responses: { '/api/rooms/joinRoom1234': { body: { roomId: 'joinRoom1234' } } } });
+  b.element('join-code-form').hidden = true;
+  b.event('show-join', 'click');
+  assert.equal(b.element('join-code-form').hidden, false);
+  b.element('room-link').value = 'http://localhost:3000/room/joinRoom1234';
+  b.event('join-code-form', 'submit');
+  assert.equal(b.element('join-overlay').hidden, false);
+  await b.event('join-form', 'submit');
+  b.sockets[0].emit('open');
+  assert.equal(b.messages.find((message) => message.type === 'join').roomId, 'joinRoom1234');
+  const state = room(b, { host: true, playing: false });
+  state.queue.push(track('track-b'));
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'state', serverTime: b.now(), room: state }) });
+  const widget = b.widgets.at(-1);
+  widget.emit(EVENTS.READY);
+  widget.resolvePosition(10000);
+  b.element('track-url').value = 'https://soundcloud.com/artist/next-track';
+  b.event('add-form', 'submit');
+  assert.equal(b.messages.find((message) => message.type === 'add').url, 'https://soundcloud.com/artist/next-track');
+  b.element('seek').value = '500';
+  b.event('seek', 'change');
+  assert.equal(b.messages.find((message) => message.action === 'seek').positionMs, 120000);
+  const secondQueueItem = b.element('queue').children[1];
+  secondQueueItem.children[0].listeners.get('click')();
+  secondQueueItem.children[1].listeners.get('click')();
+  assert.ok(b.messages.some((message) => message.action === 'select' && message.trackId === 'track-b'));
+  assert.ok(b.messages.some((message) => message.action === 'remove' && message.trackId === 'track-b'));
+  b.event('skip-button', 'click');
+  assert.ok(b.messages.some((message) => message.action === 'skip'));
+  b.event('join-back', 'click');
+  assert.equal(b.element('landing').hidden, false);
+});
+
+test('a missing programmatic pause echo cannot swallow a later native play then pause', () => {
+  const b = browser({ asyncEvents: true });
+  const widget = load(b, room(b, { host: true, playing: false }));
+  widget.paused = false;
+  widget.resolvePosition(10000); // Pause issued; deliberately lose its echo.
+  b.discardWidgetEvents();
+  b.messages.length = 0;
+  widget.paused = false;
+  widget.emit(EVENTS.PLAY, { currentPosition: 10000 });
+  widget.deferPaused = true;
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE, { currentPosition: 10100 });
+  b.interval(2500);
+  assert.equal(widget.pendingPositions.length, 0, 'reconciliation waits for the ambiguous native event confirmation');
+  widget.resolvePaused(true);
+  assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['play', 'pause']);
+  assert.equal(b.app.status().pendingIntent.playing, false);
+  assert.equal(b.element('play-button')['aria-label'], 'Play shared track');
+});
+
+test('server acknowledgment during an intent getter cannot leave the sync lock stuck', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, room(b, { host: true, playing: false }));
+  widget.resolvePosition(10000);
+  b.event('play-button', 'click');
+  b.app.reconcile();
+  assert.equal(widget.pendingPositions.length, 1);
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'state', serverTime: b.now(), room: room(b, { host: true, playing: true, revision: 2 }) }) });
+  assert.equal(b.app.status().pendingIntent, null);
+  assert.equal(widget.pendingPositions.length, 2, 'acknowledgment starts a fresh reconciliation');
+  widget.resolvePosition(10000); // Invalidated intent getter.
+  widget.resolvePosition(10000); // New authoritative getter.
+  assert.equal(b.app.status().syncing, false);
+  b.app.reconcile();
+  assert.equal(widget.pendingPositions.length, 1, 'future reconciliations are not locked out');
+  widget.resolvePosition(10000);
+  assert.equal(b.app.status().syncing, false);
 });

@@ -24,12 +24,26 @@ function position(value) {
   return Math.round(value);
 }
 
+function soundcloudId(value) {
+  if (typeof value === 'number' && !Number.isSafeInteger(value)) return null;
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  return /^(?:soundcloud:tracks:)?([1-9][0-9]{0,19})$/.exec(String(value))?.[1] ?? null;
+}
+
 function metadata(value) {
   const result = {};
   const title = text(value.title, 200);
   const artist = text(value.artist, 100);
   if (title) result.title = title;
   if (artist) result.artist = artist;
+  const id = soundcloudId(value.soundcloudId);
+  if (id) result.soundcloudId = id;
+  if (typeof value.permalinkUrl === 'string') {
+    try {
+      const permalink = normalizeTrackUrl(value.permalinkUrl);
+      if (new URL(permalink).hostname === 'soundcloud.com') result.permalinkUrl = permalink;
+    } catch { /* Public track links are optional metadata. */ }
+  }
   if (value.duration !== undefined) result.duration = position(value.duration);
   if (typeof value.artwork === 'string' && value.artwork.length < 2048) {
     try {
@@ -43,8 +57,14 @@ function metadata(value) {
 function newTrack(value, member) {
   requireValue(value && typeof value === 'object' && !Array.isArray(value), 'invalid_track', 'Each playlist item must be a SoundCloud track.');
   const url = normalizeTrackUrl(value.url);
-  const parts = new URL(url).pathname.split('/').filter(Boolean);
-  return { id: randomUUID(), url, title: parts[1].replace(/-/g, ' '), artist: parts[0], artwork: null, duration: 0, addedBy: member.id, addedByName: member.name, ...metadata(value) };
+  const parsed = new URL(url);
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  const byId = parsed.hostname === 'api.soundcloud.com';
+  return { id: randomUUID(), url, title: byId ? `SoundCloud track ${parts[1]}` : parts[1].replace(/-/g, ' '), artist: byId ? 'SoundCloud' : parts[0], artwork: null, duration: 0, addedBy: member.id, addedByName: member.name, ...metadata(value), ...(byId ? { soundcloudId: parts[1] } : {}) };
+}
+
+function trackKeys(track) {
+  return [`url:${track.url}`, ...(track.permalinkUrl ? [`url:${track.permalinkUrl}`] : []), ...(track.soundcloudId ? [`id:${track.soundcloudId}`] : [])];
 }
 
 export function getPosition(room, at = Date.now()) {
@@ -59,6 +79,14 @@ export function normalizeTrackUrl(value) {
   try { url = new URL(value); } catch { throw new RoomError('invalid_url', 'Paste a full SoundCloud track link.'); }
   if (url.hostname === 'on.soundcloud.com' || url.hostname === 'snd.sc') {
     throw new RoomError('short_link', 'Open this link in SoundCloud, then copy the full track address from your browser.');
+  }
+  // Playlist widgets may expose only an ID for tracks beyond the first five.
+  // The official player accepts this exact public track reference directly.
+  if (url.hostname === 'api.soundcloud.com') {
+    const match = /^\/tracks\/([1-9][0-9]{0,19})$/.exec(url.pathname);
+    requireValue(url.protocol === 'https:' && !url.username && !url.password && !url.port && match, 'invalid_url', 'Use a public SoundCloud track address.');
+    requireValue(!url.searchParams.has('secret_token'), 'private_track', 'This prototype supports public tracks. Choose a public SoundCloud link.');
+    return `https://api.soundcloud.com/tracks/${match[1]}`;
   }
   requireValue(url.protocol === 'https:' && ['soundcloud.com', 'www.soundcloud.com'].includes(url.hostname) && !url.username && !url.password && !url.port, 'invalid_url', 'Use an https://soundcloud.com/artist/track link.');
   const segments = url.pathname.split('/').filter(Boolean);
@@ -284,7 +312,8 @@ export function createRoomStore({
     if (message.type === 'add') {
       requireValue(room.queue.length < 100, 'queue_full', 'The queue is full (100 tracks).');
       const track = newTrack({ url: message.url }, member);
-      requireValue(!room.queue.some((item) => item.url === track.url), 'duplicate_track', 'That track is already in the queue.');
+      const keys = new Set(trackKeys(track));
+      requireValue(!room.queue.some((item) => trackKeys(item).some((key) => keys.has(key))), 'duplicate_track', 'That track is already in the queue.');
       room.queue.push(track);
       if (!room.currentTrackId) select(room, track.id);
       else resume(room);
@@ -292,10 +321,11 @@ export function createRoomStore({
       requireValue(Array.isArray(message.tracks) && message.tracks.length > 0 && message.tracks.length <= 100, 'invalid_batch', 'Import between 1 and 100 tracks at a time.');
       // Validate every item before changing the queue, including duplicated items.
       const prepared = message.tracks.map((item) => newTrack(item, member));
-      const seen = new Set(room.queue.map((track) => track.url));
+      const seen = new Set(room.queue.flatMap(trackKeys));
       const additions = prepared.filter((track) => {
-        if (seen.has(track.url)) return false;
-        seen.add(track.url);
+        const keys = trackKeys(track);
+        if (keys.some((key) => seen.has(key))) return false;
+        for (const key of keys) seen.add(key);
         return true;
       });
       requireValue(additions.length > 0, 'duplicate_track', 'These tracks are already in the queue.');
@@ -316,7 +346,9 @@ export function createRoomStore({
       requireHost(room, member);
       const track = room.queue.find((item) => item.id === message.trackId);
       requireValue(track, 'track_not_found', 'This track is no longer in the queue.');
-      Object.assign(track, metadata(message));
+      const details = metadata(message);
+      if (new URL(track.url).hostname === 'api.soundcloud.com') details.soundcloudId = new URL(track.url).pathname.split('/').at(-1);
+      Object.assign(track, details);
     } else if (message.type === 'position') {
       requireHost(room, member);
       requireValue(room.currentTrackId && message.trackId === room.currentTrackId, 'stale_track', 'Playback changed. Sync to the current track.');

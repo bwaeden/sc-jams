@@ -425,6 +425,113 @@ test('canceling a playlist ignores its late metadata callback and cannot import 
   assert.equal(b.element('playlist-import').hidden, true);
 });
 
+test('a 115-track playlist with only five full entries imports 100 tracks and explains the overflow', () => {
+  const b = browser();
+  const state = room(b);
+  state.queue = [];
+  state.currentTrackId = null;
+  b.app.configure({ room: state });
+  b.app.previewPlaylist('https://soundcloud.com/b9t/sets/playlist-mf-foh');
+  const preview = b.widgets.at(-1);
+  preview.emit(EVENTS.READY);
+  // SoundCloud returns this shape: five full sounds, then ID-only objects.
+  const sounds = Array.from({ length: 115 }, (_, index) => index < 5
+    ? { id: 1803239797 + index, permalink_url: `https://soundcloud.com/artist/playlist-${index}`, title: `Song ${index + 1}`, user: { username: 'Artist' }, duration: 30000 }
+    : { id: 1803239797 + index });
+  preview.resolveSounds(sounds);
+  const tracks = b.app.status().playlistTracks;
+  assert.equal(tracks.length, 100);
+  assert.equal(tracks[5].url, 'https://api.soundcloud.com/tracks/1803239802');
+  assert.equal(tracks[5].soundcloudId, '1803239802');
+  assert.equal(tracks[0].title, 'Song 1');
+  assert.equal(tracks[0].permalinkUrl, 'https://soundcloud.com/artist/playlist-0');
+  assert.equal(tracks[5].title, 'Playlist track 6');
+  assert.match(b.element('import-status').textContent, /100 of 115 tracks ready/);
+  assert.match(b.element('import-status').textContent, /15 won't fit \(queue limit 100\)/);
+  assert.equal(b.element('import-playlist-button').textContent, 'Add 100 tracks');
+  assert.equal(preview.calls.some((call) => call.method === 'play'), false, 'importing metadata must not start preview audio');
+  b.event('import-playlist-button', 'click');
+  const batch = b.messages.find((message) => message.type === 'add_many');
+  assert.equal(batch.tracks.length, 100);
+  assert.equal(batch.tracks.at(-1).url, 'https://api.soundcloud.com/tracks/1803239896');
+});
+
+test('playlist import recalculates available capacity when the shared queue changes', () => {
+  const b = browser();
+  b.app.connect();
+  b.app.configure({ room: room(b) });
+  b.app.previewPlaylist('https://soundcloud.com/artist/sets/a-playlist');
+  const preview = b.widgets.at(-1);
+  preview.emit(EVENTS.READY);
+  preview.resolveSounds(Array.from({ length: 115 }, (_, index) => ({ id: 8000 + index })));
+  assert.equal(b.app.status().playlistTracks.length, 99);
+  const filled = room(b, { revision: 2 });
+  filled.queue.push(...Array.from({ length: 98 }, (_, index) => track(`existing-${index}`)));
+  receive(b, filled);
+  assert.equal(b.app.status().playlistTracks.length, 1);
+  assert.equal(b.element('import-playlist-button').textContent, 'Add 1 track');
+  b.event('import-playlist-button', 'click');
+  assert.equal(b.messages.find((message) => message.type === 'add_many').tracks.length, 1);
+});
+
+test('playlist ID references validate and deduplicate against canonical links and queued sound IDs', () => {
+  const b = browser();
+  const state = room(b);
+  state.queue[0].soundcloudId = '1803239802';
+  b.app.configure({ room: state });
+  b.app.previewPlaylist('https://soundcloud.com/artist/sets/a-playlist');
+  const preview = b.widgets.at(-1);
+  preview.emit(EVENTS.READY);
+  preview.resolveSounds([
+    { id: 1803239802 },
+    { id: 'soundcloud:tracks:1803239803' },
+    { urn: 'soundcloud:tracks:1803239803' },
+    { uri: 'https://api.soundcloud.com/tracks/1803239804' },
+    { id: 1803239805, permalink_url: state.queue[0].url },
+    ...[0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '12x', '123456789012345678901'].map((id) => ({ id })),
+    { id: 1803239806, sharing: 'private' },
+    { id: 1803239807, access: 'blocked' },
+    { id: 1803239808, secret_token: 's-secret' },
+    { id: 1803239809, kind: 'playlist' },
+    { id: 1803239810, permalink_url: 'https://example.com/artist/fake' },
+  ]);
+  const tracks = b.app.status().playlistTracks;
+  assert.equal(tracks.length, 2);
+  assert.deepEqual(Array.from(tracks, (track) => track.soundcloudId), ['1803239803', '1803239804']);
+  assert.match(b.element('import-status').textContent, /3 already queued or repeated/);
+  assert.match(b.element('import-status').textContent, /11 unavailable/);
+});
+
+test('ID-only tracks autoplay and hydrate metadata, while stale sound details cannot ready a new source', () => {
+  const b = browser();
+  b.app.connect();
+  const initial = lobby(b, { host: true, generation: 1 });
+  const widget = load(b, initial);
+  resolvePositions(widget);
+  const next = lobby(b, { host: true, id: 'imported-track', position: 0, generation: 2, revision: 2 });
+  next.queue[0].url = 'https://api.soundcloud.com/tracks/1803239802';
+  next.queue[0].title = 'Playlist track 6';
+  receive(b, next);
+  assert.equal(b.element('track-link').hidden, true, 'never link a listener to the raw API endpoint');
+  widget.getCurrentSound = (callback) => callback({ id: 1803239801, permalink_url: 'https://soundcloud.com/artist/old-song' });
+  widget.emit(EVENTS.READY);
+  assert.equal(b.app.status().playerReady, false, 'late previous-source details are ignored');
+  widget.getCurrentSound = (callback) => callback(null);
+  b.timeout(250);
+  assert.equal(b.app.status().playerReady, false, 'empty details are retried too');
+  widget.getCurrentSound = (callback) => callback({ id: 1803239802, permalink_url: 'https://soundcloud.com/artist/resolved-song', title: 'Resolved song', user: { username: 'Artist' }, duration: 180000 });
+  b.timeout(250);
+  assert.equal(b.app.status().playerReady, true);
+  assert.equal(widget.paused, false);
+  assert.equal(b.element('track-title').textContent, 'Resolved song');
+  assert.equal(b.element('track-link').href, 'https://soundcloud.com/artist/resolved-song');
+  assert.equal(b.element('track-link').hidden, false);
+  const metadata = b.messages.findLast((message) => message.type === 'metadata');
+  assert.equal(metadata.soundcloudId, '1803239802');
+  assert.equal(metadata.permalinkUrl, 'https://soundcloud.com/artist/resolved-song');
+  assert.ok(widget.calls.some((call) => call.method === 'load' && call.url === next.queue[0].url));
+});
+
 test('natural finish advances once and the next track starts at READY without waiting for a getter', () => {
   const b = browser({ asyncEvents: true });
   b.app.connect();

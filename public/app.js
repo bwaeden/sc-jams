@@ -33,6 +33,7 @@ if (!Number.isFinite(volume)) volume = 70;
 volume = Math.max(0, Math.min(100, volume));
 let unmutedVolume = volume || 70;
 let playlistWidget, playlistGeneration = 0, playlistTracks = [], playlistTimer;
+let playlistCandidates = [], playlistSourceCount = 0, playlistUnavailableCount = 0, playlistReady = false;
 let finishingTrackId = null, endPauseTimer;
 let finishingPlaybackGeneration = null, pauseBlockedUntil = 0, pauseCooldownTimer, pauseCooldownMessage = '';
 let autoplayProbeTimer, needsAudioClick = false, finishCheck = null;
@@ -266,12 +267,36 @@ function setSync(label, warning = false) {
 function canonicalTrack(value) {
   let url;
   try { url = new URL(value.trim()); } catch { throw new Error('Paste a full SoundCloud track link.'); }
+  if (url.protocol === 'https:' && url.hostname === 'api.soundcloud.com' && !url.port && !url.username && !url.password && /^\/tracks\/[1-9][0-9]{0,19}$/.test(url.pathname) && !url.searchParams.has('secret_token')) return `${url.origin}${url.pathname}`;
   const parts = url.pathname.split('/').filter(Boolean);
   if (url.protocol !== 'https:' || !['soundcloud.com', 'www.soundcloud.com'].includes(url.hostname.toLowerCase()) || url.port || url.username || url.password || parts.length !== 2 || ['sets', 'likes', 'tracks', 'reposts', 'albums', 'popular-tracks'].includes(parts[1]) || parts[0] === 'discover') {
     throw new Error('Use a public track link: https://soundcloud.com/artist/track. Open short share links on SoundCloud first.');
   }
   if (url.searchParams.has('secret_token') || !parts.every((part) => /^[a-zA-Z0-9_-]+$/.test(part))) throw new Error('This prototype supports public SoundCloud tracks. Choose a public track link.');
   return `https://soundcloud.com/${parts.join('/')}`;
+}
+function soundcloudId(value) {
+  if (typeof value === 'number' && (!Number.isSafeInteger(value) || value <= 0)) return null;
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  return /^(?:soundcloud:tracks:)?([1-9][0-9]{0,19})$/.exec(String(value))?.[1] || null;
+}
+function trackSourceId(value) {
+  try {
+    const url = new URL(canonicalTrack(value));
+    return url.hostname === 'api.soundcloud.com' ? url.pathname.split('/').at(-1) : null;
+  } catch { return null; }
+}
+function soundId(sound) { return soundcloudId(sound?.id) || soundcloudId(sound?.urn) || trackSourceId(sound?.uri || ''); }
+function publicPermalink(value) {
+  try {
+    const url = canonicalTrack(value || '');
+    return new URL(url).hostname === 'soundcloud.com' ? url : null;
+  } catch { return null; }
+}
+function soundMatchesTrack(sound, track) {
+  const expectedId = trackSourceId(track.url);
+  if (expectedId) return soundId(sound) === expectedId;
+  return !sound?.permalink_url || publicPermalink(sound.permalink_url) === track.url;
 }
 function musicLink(value) {
   let url;
@@ -304,8 +329,35 @@ function closePlaylist() {
   playlistWidget?.pause();
   playlistWidget = null;
   playlistTracks = [];
+  playlistCandidates = [];
+  playlistSourceCount = playlistUnavailableCount = 0;
+  playlistReady = false;
   $('playlist-preview').replaceChildren();
   $('playlist-import').hidden = true;
+}
+function refreshPlaylistImport() {
+  if (!playlistReady) return;
+  const seen = new Set();
+  const keys = (track) => [track.url, track.permalinkUrl, soundcloudId(track.soundcloudId) || trackSourceId(track.url)].filter(Boolean);
+  for (const track of room?.queue || []) for (const key of keys(track)) seen.add(key);
+  const candidates = [];
+  let duplicates = 0;
+  for (const track of playlistCandidates) {
+    const references = keys(track);
+    if (references.some((key) => seen.has(key))) { duplicates++; continue; }
+    for (const key of references) seen.add(key);
+    candidates.push(track);
+  }
+  const available = Math.max(0, 100 - (room?.queue.length || 0));
+  playlistTracks = candidates.slice(0, available);
+  const overflow = candidates.length - playlistTracks.length;
+  const details = [`${playlistTracks.length} of ${playlistSourceCount} tracks ready`];
+  if (overflow) details.push(`${overflow} won't fit (queue limit 100)`);
+  if (duplicates) details.push(`${duplicates} already queued or repeated`);
+  if (playlistUnavailableCount) details.push(`${playlistUnavailableCount} unavailable`);
+  $('import-status').textContent = details.join(' · ');
+  $('import-playlist-button').textContent = `Add ${playlistTracks.length} ${playlistTracks.length === 1 ? 'track' : 'tracks'}`;
+  $('import-playlist-button').disabled = !playlistTracks.length || !connected;
 }
 function previewPlaylist(url) {
   closePlaylist();
@@ -328,21 +380,24 @@ function previewPlaylist(url) {
     instance.getSounds((sounds) => {
       if (generation !== playlistGeneration) return;
       clearTimeout(playlistTimer);
-      const seen = new Set(room?.queue.map((track) => track.url) || []);
-      const available = Math.max(0, 100 - (room?.queue.length || 0));
-      playlistTracks = [];
-      for (const sound of Array.isArray(sounds) ? sounds : []) {
+      const list = Array.isArray(sounds) ? sounds : [];
+      playlistSourceCount = list.length;
+      playlistUnavailableCount = 0;
+      playlistCandidates = [];
+      for (const [index, sound] of list.entries()) {
         try {
-          const trackUrl = canonicalTrack(sound.permalink_url || '');
-          if (seen.has(trackUrl) || sound.access === 'blocked') continue;
-          seen.add(trackUrl);
-          if (playlistTracks.length >= available) break;
-          playlistTracks.push({ url: trackUrl, title: String(sound.title || '').slice(0, 200), artist: String(sound.user?.username || '').slice(0, 100), duration: Math.min(86400000, Math.max(0, Number(sound.duration) || 0)) });
-        } catch { /* Only public canonical track URLs can enter the shared queue. */ }
+          if (!sound || typeof sound !== 'object' || sound.access === 'blocked' || sound.sharing === 'private' || sound.secret_token || (sound.kind && sound.kind !== 'track')) throw new Error('Unavailable track');
+          const permalinkUrl = publicPermalink(sound.permalink_url);
+          if (sound.permalink_url && !permalinkUrl) throw new Error('Invalid track link');
+          const id = soundId(sound);
+          const trackUrl = id ? `https://api.soundcloud.com/tracks/${id}` : permalinkUrl;
+          if (!trackUrl) throw new Error('Missing track reference');
+          const duration = Number(sound.duration);
+          playlistCandidates.push({ url: trackUrl, ...(id ? { soundcloudId: id } : {}), ...(permalinkUrl ? { permalinkUrl } : {}), title: String(sound.title || `Playlist track ${index + 1}`).slice(0, 200), artist: String(sound.user?.username || 'SoundCloud').slice(0, 100), duration: Number.isFinite(duration) ? Math.min(86400000, Math.max(0, duration)) : 0 });
+        } catch { playlistUnavailableCount++; }
       }
-      $('import-status').textContent = playlistTracks.length ? `${playlistTracks.length} tracks ready · queue limit 100` : 'No new playable tracks to add, or the queue is full.';
-      $('import-playlist-button').textContent = `Add ${playlistTracks.length} tracks`;
-      $('import-playlist-button').disabled = !playlistTracks.length || !connected;
+      playlistReady = true;
+      refreshPlaylistImport();
     });
   });
   instance.bind(window.SC.Widget.Events.ERROR, () => {
@@ -571,13 +626,15 @@ function renderRoom() {
     return item;
   }));
   const track = currentTrack();
-  $('track-link').hidden = !track;
+  const trackLink = track?.permalinkUrl || (track && !trackSourceId(track.url) ? track.url : null);
+  $('track-link').hidden = !trackLink;
   if (track) {
     $('track-title').textContent = track.title || track.url.split('/').at(-1).replaceAll('-', ' ');
     $('track-artist').textContent = track.artist || 'SoundCloud';
-    $('track-link').href = track.url;
+    if (trackLink) $('track-link').href = trackLink;
     if (track.duration) knownDuration = track.duration;
   }
+  refreshPlaylistImport();
   renderControls();
 }
 function renderControls() {
@@ -716,6 +773,20 @@ function loadTrack(track, force = false) {
     widget = instance;
     const events = window.SC.Widget.Events;
     const valid = () => generation === loadGeneration && widget === instance;
+    const readMetadata = (attempt = 0) => {
+      if (!valid()) return;
+      let received = false;
+      instance.getCurrentSound((sound) => {
+        if (!valid() || !sound?.title || !soundMatchesTrack(sound, track)) return;
+        received = true;
+        $('track-title').textContent = sound.title;
+        $('track-artist').textContent = sound.user?.username || 'SoundCloud';
+        const permalinkUrl = publicPermalink(sound.permalink_url);
+        if (permalinkUrl) { $('track-link').href = permalinkUrl; $('track-link').hidden = false; }
+        if (isHost()) send({ type: 'metadata', trackId: track.id, soundcloudId: soundId(sound), permalinkUrl, title: sound.title, artist: sound.user?.username, artwork: sound.artwork_url, duration: sound.duration });
+      });
+      if (!received && attempt < 20) setTimeout(() => { if (!received) readMetadata(attempt + 1); }, 250);
+    };
     const ready = () => {
       if (!valid() || playerReady) return;
       playerReady = true;
@@ -726,15 +797,7 @@ function loadTrack(track, force = false) {
       else commandPlayback(false);
       renderControls();
       instance.getDuration((duration) => { if (valid()) { knownDuration = duration || 0; renderControls(); } });
-      instance.getCurrentSound((sound) => {
-        if (!valid() || !sound) return;
-        if (sound.permalink_url) {
-          try { if (canonicalTrack(sound.permalink_url) !== track.url) return; } catch { return; }
-        }
-        $('track-title').textContent = sound.title || 'SoundCloud track';
-        $('track-artist').textContent = sound.user?.username || 'SoundCloud';
-        if (isHost()) send({ type: 'metadata', trackId: track.id, title: sound.title, artist: sound.user?.username, artwork: sound.artwork_url, duration: sound.duration });
-      });
+      readMetadata();
       reconcile(true);
     };
     instance.bind(events.PLAY_PROGRESS, (event) => {
@@ -801,14 +864,16 @@ function loadTrack(track, force = false) {
           if (!valid()) return;
           widgetSourceUrl = track.url;
           instance.load(track.url, { auto_play: Boolean(playbackState()?.playing), single_active: false, show_comments: false, visual: false, callback: () => {
-            if (!valid()) return;
-            instance.getCurrentSound((sound) => {
-              if (!valid()) return;
-              if (sound?.permalink_url) {
-                try { if (canonicalTrack(sound.permalink_url) !== track.url) return; } catch { return; }
-              }
-              ready();
-            });
+            // READY can precede hydrated sound details. Retry without accepting
+            // the previous source or letting an old generation ready this one.
+            const waitForSource = (attempt = 0) => {
+              if (!valid() || playerReady) return;
+              instance.getCurrentSound((sound) => {
+                if (valid() && !playerReady && sound && soundMatchesTrack(sound, track)) ready();
+              });
+              if (!playerReady && attempt < 20) setTimeout(() => waitForSource(attempt + 1), 250);
+            };
+            waitForSource();
           } });
         };
         if (previousReady) loadSource();
@@ -1002,6 +1067,7 @@ $('mute-button').addEventListener('click', () => {
 });
 $('theme-toggle').addEventListener('click', () => applyTheme(storage.get('theme') === 'dark' ? 'light' : 'dark'));
 $('import-playlist-button').addEventListener('click', () => {
+  refreshPlaylistImport();
   if (!playlistTracks.length) return;
   if (send({ type: 'add_many', tracks: playlistTracks })) { closePlaylist(); toast('Playlist sent to the queue.'); }
   else toast('Reconnect to the room before importing.');

@@ -165,6 +165,109 @@ test('playlist imports enforce the queue cap without partially appending tracks'
   assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'queue_full');
 });
 
+test('playlist imports retain ID-only tracks through the 100-track cap and play them normally', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  const guest = connect({ name: 'Playlist friend' });
+  await guest.join(roomId);
+  const tracks = Array.from({ length: 100 }, (_, index) => index < 5
+    ? { url: `https://soundcloud.com/artist/playlist-${index}`, title: `Full track ${index + 1}` }
+    : { url: `https://api.soundcloud.com/tracks/${2000000 + index}` });
+  tracks[5].url += '?utm_source=share';
+  tracks[5].title = 'Playlist track 6';
+  guest.send({ type: 'add_many', tracks });
+  const imported = await host.state((room) => room.queue.length === 100);
+  assert.equal(imported.room.queue.filter((track) => track.url.startsWith('https://api.soundcloud.com/tracks/')).length, 95);
+  assert.equal(imported.room.queue[5].url, 'https://api.soundcloud.com/tracks/2000005');
+  assert.equal(imported.room.queue[5].soundcloudId, '2000005');
+  assert.equal(imported.room.queue[5].title, 'Playlist track 6');
+  assert.equal(imported.room.queue[6].title, 'SoundCloud track 2000006');
+  assert.equal(imported.room.queue[6].artist, 'SoundCloud');
+  assert.ok(imported.room.queue.every((track) => track.addedBy === guest.identity.clientId && track.addedByName === 'Playlist friend'));
+  assert.equal(imported.room.playback.playing, true);
+  host.send({ type: 'add', url: 'https://api.soundcloud.com/tracks/2000100' });
+  assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'queue_full');
+  host.send({ type: 'add_many', tracks: [{ url: 'https://api.soundcloud.com/tracks/2000100' }] });
+  assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'queue_full');
+  const selected = imported.room.queue[5];
+  host.send({ type: 'control', action: 'select', trackId: selected.id });
+  const playing = await host.state((room) => room.currentTrackId === selected.id);
+  assert.equal(playing.room.queue[0].url, selected.url);
+  assert.equal(playing.room.playback.playing, true);
+  host.send({ type: 'metadata', trackId: selected.id, title: 'Resolved track title', artist: 'Resolved artist', duration: 123456, permalinkUrl: 'https://soundcloud.com/artist/resolved-track?utm_source=share' });
+  const hydrated = await guest.state((room) => room.queue[0].title === 'Resolved track title');
+  assert.equal(hydrated.room.queue[0].artist, 'Resolved artist');
+  assert.equal(hydrated.room.queue[0].permalinkUrl, 'https://soundcloud.com/artist/resolved-track');
+  assert.equal(hydrated.room.queue[0].url, selected.url, 'resolving a public link must retain the playback source');
+  assert.equal(hydrated.room.queue[0].addedByName, 'Playlist friend');
+});
+
+test('ID-only track references reject malformed and private API addresses atomically', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  for (const url of [
+    'http://api.soundcloud.com/tracks/293',
+    'https://api.soundcloud.com/tracks/0',
+    'https://api.soundcloud.com/tracks/-293',
+    'https://api.soundcloud.com/tracks/0293',
+    'https://api.soundcloud.com/tracks/1.5',
+    'https://api.soundcloud.com/tracks/123456789012345678901',
+    'https://api.soundcloud.com/tracks/293/stream',
+    'https://api.soundcloud.com/playlists/293',
+    'https://api.soundcloud.com/tracks/%32%39%33',
+    'https://api.soundcloud.com:444/tracks/293',
+    'https://user:password@api.soundcloud.com/tracks/293',
+    'https://api.soundcloud.com.evil.example/tracks/293',
+    'https://api.soundcloud.com/tracks/293?secret_token=s-private',
+  ]) {
+    host.send({ type: 'add_many', tracks: [{ url: TRACK_A }, { url }] });
+    const error = await host.waitFor((message) => message.type === 'error');
+    assert.equal(error.code, url.includes('secret_token') ? 'private_track' : 'invalid_url', url);
+  }
+  const guest = connect();
+  const empty = await guest.join(roomId);
+  assert.deepEqual(empty.room.queue, []);
+  host.send({ type: 'add', url: 'https://api.soundcloud.com/tracks/293?utm_source=share' });
+  const added = await guest.state((room) => room.queue.length === 1);
+  assert.equal(added.room.queue[0].url, 'https://api.soundcloud.com/tracks/293');
+  host.send({ type: 'add', url: 'https://api.soundcloud.com/tracks/293' });
+  assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'duplicate_track');
+});
+
+test('playlist deduplication shares validated track IDs and permalinks without trusting attribution', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  host.send({ type: 'add', url: TRACK_A });
+  const initial = await host.state((room) => room.queue.length === 1);
+  host.send({ type: 'metadata', trackId: initial.room.queue[0].id, soundcloudId: 'soundcloud:tracks:293', permalinkUrl: TRACK_A });
+  await host.state((room) => room.queue[0].soundcloudId === '293');
+  const guest = connect({ name: 'Playlist friend' });
+  await guest.join(roomId);
+  guest.send({ type: 'add_many', tracks: [
+    { url: 'https://api.soundcloud.com/tracks/293', title: 'Already queued by public link' },
+    { url: TRACK_B, soundcloudId: 42, permalinkUrl: TRACK_B + '?utm_source=share' },
+    { url: 'https://api.soundcloud.com/tracks/42', title: 'Already imported by ID' },
+    { url: 'https://api.soundcloud.com/tracks/43', soundcloudId: '999', addedBy: host.identity.clientId, addedByName: 'Forged', permalinkUrl: 'https://evil.example/fake' },
+  ] });
+  const imported = await host.state((room) => room.queue.length === 3);
+  assert.equal(imported.room.queue[1].soundcloudId, '42');
+  assert.equal(imported.room.queue[1].permalinkUrl, TRACK_B);
+  assert.equal(imported.room.queue[2].soundcloudId, '43', 'the API source ID overrides supplied metadata');
+  assert.equal(imported.room.queue[2].permalinkUrl, undefined);
+  assert.equal(imported.room.queue[2].addedBy, guest.identity.clientId);
+  assert.equal(imported.room.queue[2].addedByName, 'Playlist friend');
+  guest.send({ type: 'add', url: 'https://api.soundcloud.com/tracks/42' });
+  assert.equal((await guest.waitFor((message) => message.type === 'error')).code, 'duplicate_track');
+  host.send({ type: 'metadata', trackId: imported.room.queue[2].id, soundcloudId: '999', permalinkUrl: 'https://soundcloud.com/artist/third-track' });
+  const updated = await guest.state((room) => room.queue[2].permalinkUrl === 'https://soundcloud.com/artist/third-track');
+  assert.equal(updated.room.queue[2].soundcloudId, '43');
+  guest.send({ type: 'add', url: 'https://soundcloud.com/artist/third-track' });
+  assert.equal((await guest.waitFor((message) => message.type === 'error')).code, 'duplicate_track');
+  guest.send({ type: 'add_many', tracks: [
+    { url: 'https://soundcloud.com/artist/unsafe-number', soundcloudId: Number.MAX_SAFE_INTEGER + 1, permalinkUrl: 'https://api.soundcloud.com/tracks/294' },
+    { url: 'https://soundcloud.com/artist/invalid-id', soundcloudId: 'soundcloud:tracks:0', permalinkUrl: 'https://soundcloud.com/artist/private?secret_token=s-secret' },
+  ] });
+  const sanitized = await host.state((room) => room.queue.length === 5);
+  assert.ok(sanitized.room.queue.slice(3).every((track) => track.soundcloudId === undefined && track.permalinkUrl === undefined), 'invalid optional metadata is ignored');
+});
+
 test('guests cannot seek, remove tracks, or publish host position', async (t) => {
   const { roomId, host, connect } = await fixture(t);
   host.send({ type: 'add', url: TRACK_A });

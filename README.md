@@ -32,7 +32,9 @@ Listeners who leave the name blank appear as **User**. Session IDs are never use
 
 Use full URLs such as `https://soundcloud.com/artist/track` or `https://soundcloud.com/artist/sets/playlist`. Open shortened share links in SoundCloud first, then copy the full address. Private tracks, profile pages, and likes pages cannot be pasted as playlists.
 
-Playlist import uses the Widget API's `getSounds` result and adds individual public tracks. Duplicate tracks are omitted, and the shared queue holds at most 100 tracks. The preview may expose only part of a large playlist; restricted or unavailable tracks can still fail during playback.
+Playlist import uses the Widget API's `getSounds` result and adds individual public tracks. SoundCloud may supply full details for only the first five entries; the remaining ID-only entries are retained using the official player's supported numeric track references. Those entries initially show a playlist position, then their titles and artists update as they load for playback. No SoundCloud API credentials are needed for this import.
+
+Duplicate tracks are omitted, and the shared queue holds at most 100 tracks, including the current track. Import fills the available spaces and reports entries that cannot fit: a 115-track playlist in an empty room offers **Add 100 tracks** and explains that 15 exceed the limit. Capacity updates if someone changes the queue while the preview is open. Restricted or unavailable tracks can still fail during playback.
 
 Adding music starts playback, including resuming an existing paused track when adding to a populated queue. Finishing, skipping, selecting, or looping a track starts the next playback automatically. With repeat off, completed tracks leave the queue instead of accumulating as history. Their rows slide upward and collapse briefly; reduced-motion preferences disable the animation. A single remaining track repeats until another is queued, then advances on its next completion.
 

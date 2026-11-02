@@ -236,6 +236,8 @@ export function createRoomStore({
   }
 
   function resume(room) {
+    // Appending to an active queue must not look like a seek or restart to clients.
+    if (room.playback.playing) return;
     const at = now();
     room.playback = { ...room.playback, positionMs: getPosition(room, at), playing: true, updatedAt: at };
     room.lastMusicActivityAt = at;

@@ -60,7 +60,7 @@ class Peer {
     return this.state((room) => room.members.some((member) => member.id === this.identity.clientId));
   }
 
-  close() { this.socket.terminate(); }
+  close() { this.socket.close(1000, 'Left room'); }
 }
 
 async function fixture(t, options = {}) {
@@ -104,6 +104,76 @@ test('a friend can add a track and both clients receive the same queue revision'
   assert.equal(hostState.room.playback.playing, true);
   assert.ok(!JSON.stringify(hostState).includes(host.identity.token));
   assert.ok(!JSON.stringify(guestState).includes(guest.identity.token));
+});
+
+test('adding songs during playback preserves the host and the exact running timeline', async (t) => {
+  let timestamp = 10_000;
+  const { roomId, host, connect } = await fixture(t, { now: () => timestamp });
+  const guest = connect({ name: 'Friend' });
+  await guest.join(roomId);
+  host.send({ type: 'add', url: TRACK_A });
+  const started = await host.state((room) => room.queue.length === 1);
+  timestamp += 5000;
+  guest.send({ type: 'add', url: TRACK_B });
+  const added = await host.state((room) => room.queue.length === 2);
+  assert.equal(added.room.hostId, started.room.hostId);
+  assert.equal(added.room.currentTrackId, started.room.currentTrackId);
+  assert.deepEqual(added.room.playback, started.room.playback);
+  timestamp += 5000;
+  host.send({ type: 'add_many', tracks: [{ url: 'https://soundcloud.com/artist/third' }] });
+  const imported = await host.state((room) => room.queue.length === 3);
+  assert.equal(imported.room.hostId, started.room.hostId);
+  assert.deepEqual(imported.room.playback, started.room.playback);
+});
+
+test('a brief host connection loss preserves hosting and playback across reconnect', async (t) => {
+  const { app, roomId, host, connect } = await fixture(t, { reconnectGraceMs: 500 });
+  const guest = connect({ name: 'Friend' });
+  await guest.join(roomId);
+  host.send({ type: 'add', url: TRACK_A });
+  const started = await guest.state((room) => room.queue.length === 1);
+  const closed = new Promise((resolve) => host.socket.once('close', resolve));
+  host.socket.terminate();
+  await closed;
+  const returned = connect(host.identity);
+  const rejoined = await returned.join(roomId);
+  assert.equal(rejoined.room.hostId, host.identity.clientId);
+  assert.deepEqual(rejoined.room.playback, started.room.playback);
+  await delay(550);
+  await barrier(returned);
+  assert.equal(app.rooms.get(roomId).hostId, host.identity.clientId, 'old disconnect timer cannot remove the new connection');
+  assert.equal(app.rooms.get(roomId).members.size, 2);
+  assert.equal(app.rooms.get(roomId).playback.playing, true);
+});
+
+test('a solo host reconnect does not pause or restart the current song', async (t) => {
+  const { roomId, host, connect } = await fixture(t, { reconnectGraceMs: 500 });
+  host.send({ type: 'add', url: TRACK_A });
+  const started = await host.state((room) => room.queue.length === 1);
+  const closed = new Promise((resolve) => host.socket.once('close', resolve));
+  host.socket.terminate();
+  await closed;
+  const returned = connect(host.identity);
+  const rejoined = await returned.join(roomId);
+  assert.equal(rejoined.room.hostId, host.identity.clientId);
+  assert.deepEqual(rejoined.room.playback, started.room.playback);
+});
+
+test('hosting passes on after the reconnect grace expires, while explicit Leave remains immediate', async (t) => {
+  const { roomId, host, connect } = await fixture(t, { reconnectGraceMs: 100 });
+  const guest = connect({ name: 'Friend' });
+  await guest.join(roomId);
+  host.send({ type: 'add', url: TRACK_A });
+  const started = await guest.state((room) => room.queue.length === 1);
+  host.socket.terminate();
+  const passed = await guest.state((room) => room.hostId === guest.identity.clientId);
+  assert.deepEqual(passed.room.playback, started.room.playback);
+  assert.equal(passed.room.members.length, 1);
+  const returned = connect(host.identity);
+  await returned.join(roomId);
+  guest.close();
+  const immediate = await returned.state((room) => room.hostId === host.identity.clientId);
+  assert.equal(immediate.room.members.length, 1);
 });
 
 test('a playlist import is atomic when one of its tracks is invalid', async (t) => {

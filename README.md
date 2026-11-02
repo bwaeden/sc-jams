@@ -60,7 +60,11 @@ The layout follows the restrained hierarchy of [Linear's interface refresh](http
 
 Shared playback controls are enabled after SoundCloud reports that the player is ready. Every listener's play/pause actions from either the site's controls or the SoundCloud embed use the same synchronization flow. A local action takes effect immediately and remains pending until the server confirms it; older asynchronous position callbacks cannot undo a newer action. Volume remains personal.
 
-Disconnected users leave the listener list immediately. If the host leaves, hosting passes immediately to the connected listener who joined earliest. A returning former host rejoins at the end of that order. Invite links have no password: anyone with the link can join and add music.
+Choosing **Leave** removes a listener immediately. If the host leaves, hosting passes immediately to the connected listener who joined earliest. A host whose connection drops unexpectedly has 15 seconds to reconnect with the same session before hosting passes on; the current song's timeline continues during that interval. A former host returning after that interval rejoins at the end of the order. Invite links have no password: anyone with the link can join and add music.
+
+Switching to another tab does not send a shared pause when the browser or SoundCloud interrupts that tab's audio. Returning to the room catches the local player up to the shared timeline. Adding songs to an already playing queue leaves the current player and its timeline running; adding to a paused queue still resumes playback.
+
+Browsers with Web Locks support give duplicated room tabs separate listener identities, so opening a copy cannot replace the original tab's connection. Refreshing a tab reuses its session to reconnect.
 
 ## Autoplay and inactive rooms
 

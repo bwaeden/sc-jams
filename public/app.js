@@ -3,7 +3,8 @@ const storage = {
   get(key) { try { return localStorage.getItem(`sc-jams:${key}`) ?? localStorage.getItem(`sidecar:${key}`); } catch { return null; } },
   set(key, value) { try { localStorage.setItem(`sc-jams:${key}`, value); } catch {} },
 };
-// Session identity keeps separate tabs independent while allowing a refresh to reconnect.
+// Reuse a document's session after refresh. A duplicated tab may inherit this
+// storage, so reserve its identity before joining and rotate only live copies.
 function sessionValue(key) {
   try {
     let value = sessionStorage.getItem(`sc-jams:${key}`);
@@ -11,14 +12,37 @@ function sessionValue(key) {
     return value;
   } catch { return crypto.randomUUID(); }
 }
-const clientId = sessionValue('id');
-const token = sessionValue('token');
+let clientId = sessionValue('id');
+let token = sessionValue('token');
+const identityReady = navigator.locks?.request ? new Promise((ready) => {
+  const claim = () => {
+    try {
+      navigator.locks.request(`sc-jams:session:${clientId}`, { ifAvailable: true }, (lock) => {
+        if (!lock) {
+          clientId = crypto.randomUUID();
+          token = crypto.randomUUID();
+          try {
+            sessionStorage.setItem('sc-jams:id', clientId);
+            sessionStorage.setItem('sc-jams:token', token);
+          } catch {}
+          claim();
+          return;
+        }
+        ready();
+        // The browser releases this lock when the document is destroyed.
+        return new Promise(() => {});
+      }).catch(ready);
+    } catch { ready(); }
+  };
+  claim();
+}) : null;
 const rememberedName = storage.get('name') || '';
 const initialName = /^Listener [0-9a-f]{4}$/i.test(rememberedName) ? '' : rememberedName;
 $('create-name').value = initialName;
 $('join-name').value = initialName;
 let socket, room, roomId, displayName, reconnectTimer, pingTimer, heartbeatTimer;
 let reconnectDelay = 600, stopped = false, connected = false;
+let visibilityGeneration = 0;
 let clockOffset = 0, clockSamples = [], lastRevision = -1, joinedOnce = false;
 let widget, loadedTrackId, loadedPlaybackGeneration = null, playerReady = false, loadGeneration = 0, widgetSourceUrl = null;
 let audioEnabled = false, syncing = false, lastCorrection = 0;
@@ -75,6 +99,15 @@ function consumeWidgetEvent(type, positionMs) {
   return true;
 }
 function handleNativePlayback(playing, event = {}) {
+  // A background iframe can be interrupted by the browser or another player.
+  // Its local audio state must not become a play/pause command for everyone.
+  if (document.hidden) {
+    consumeWidgetEvent(playing ? 'PLAY' : 'PAUSE');
+    lastWidgetPlaying = playing;
+    if (playing) confirmPlaying();
+    else audioEnabled = false;
+    return;
+  }
   if (finishingTrackId === room?.currentTrackId) return;
   if (finishCheck) { finishCheck.nativeEvent = { playing, event }; return; }
   const position = Number.isFinite(event.currentPosition) ? event.currentPosition : lastPosition;
@@ -452,8 +485,12 @@ function connect() {
   const next = new WebSocket(`${protocol}//${location.host}/ws`);
   socket = next;
   next.addEventListener('open', () => {
-    if (socket !== next) return;
-    next.send(JSON.stringify({ type: 'join', roomId, clientId, token, name: displayName }));
+    const join = () => {
+      if (socket !== next || next.readyState !== WebSocket.OPEN || stopped) return;
+      next.send(JSON.stringify({ type: 'join', roomId, clientId, token, name: displayName }));
+    };
+    if (identityReady) identityReady.then(join);
+    else join();
   });
   next.addEventListener('message', ({ data }) => {
     if (socket !== next) return;
@@ -651,7 +688,7 @@ function renderControls() {
   const controls = available && !pauseCoolingDown();
   $('play-button').disabled = !controls;
   const skipAvailable = Boolean(track && connected && playerReady);
-  const vote = room?.skipVote?.trackId === room?.currentTrackId ? room.skipVote : null;
+  const vote = room?.skipVote && room.skipVote.trackId === room.currentTrackId ? room.skipVote : null;
   const voted = Boolean(vote?.voterIds?.includes(clientId));
   const voteRequired = !isHost() && listenerCount() > 2;
   $('skip-button').disabled = !skipAvailable || (voteRequired && voted);
@@ -958,10 +995,10 @@ setInterval(() => reconcile(), 2500);
 // Server time remains authoritative. Host reports are deliberately infrequent and
 // only correct real buffering stalls, rather than moving the room every frame.
 heartbeatTimer = setInterval(() => {
-  if (!isHost() || !connected || !playerReady || !audioEnabled || syncing || pendingIntent || playerUnavailable || !room.playback.playing || !lastWidgetPlaying) return;
-  const instance = widget, trackId = loadedTrackId, baseRevision = room.revision;
+  if (document.hidden || !isHost() || !connected || !playerReady || !audioEnabled || syncing || pendingIntent || playerUnavailable || !room.playback.playing || !lastWidgetPlaying) return;
+  const instance = widget, trackId = loadedTrackId, baseRevision = room.revision, visibility = visibilityGeneration;
   instance.getPosition((position) => {
-    if (instance !== widget || trackId !== room?.currentTrackId || baseRevision !== room?.revision) return;
+    if (document.hidden || visibility !== visibilityGeneration || instance !== widget || trackId !== room?.currentTrackId || baseRevision !== room?.revision) return;
     if (Math.abs(targetPosition() - position) > 1500 && Date.now() - lastHostReport > 8000) {
       lastHostReport = Date.now();
       send({ type: 'position', trackId, positionMs: position, playing: true, baseRevision });
@@ -1088,7 +1125,7 @@ function leaveRoom() {
   clearInterval(pingTimer);
   const previous = socket;
   socket = null;
-  previous?.close();
+  previous?.close(1000, 'Left room');
   connected = false;
   window.SCJamsQueue?.clear();
   closePlaylist();
@@ -1139,7 +1176,21 @@ $('join-back').addEventListener('click', leaveRoom);
 $('new-room-button').addEventListener('click', leaveRoom);
 applyVolume();
 applyTheme(storage.get('theme') || (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { send({ type: 'ping', sentAt: Date.now() }); reconcile(true); } });
+document.addEventListener('visibilitychange', () => {
+  // Getters and native-event confirmations may have waited in a suspended tab.
+  // Resume from a fresh sample of the current server timeline.
+  nativeCheck = null;
+  visibilityGeneration++;
+  finishCheck = null;
+  clearTimeout(endPauseTimer);
+  endPauseTimer = null;
+  invalidateReconcile();
+  if (!document.hidden) {
+    needsAudioClick = false;
+    send({ type: 'ping', sentAt: Date.now() });
+    reconcile(true);
+  }
+});
 window.addEventListener('beforeunload', () => { stopped = true; clearInterval(heartbeatTimer); socket?.close(); });
 
 const path = location.pathname.match(/^\/room\/([A-Za-z0-9_-]{6,64})\/?$/);

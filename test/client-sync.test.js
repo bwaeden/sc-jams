@@ -9,9 +9,9 @@ const EVENTS = Object.fromEntries(['READY', 'PLAY_PROGRESS', 'PLAY', 'PAUSE', 'S
 
 // This deliberately leaves widget getters pending. SoundCloud's iframe API is
 // asynchronous, so track changes and server updates can arrive before a getter.
-function browser({ saved = {}, asyncEvents = false, responses = {}, blockPlay = false } = {}) {
+function browser({ saved = {}, session = {}, locks, asyncEvents = false, responses = {}, blockPlay = false } = {}) {
   let timestamp = 1_800_000_000_000, monotonic = 10_000, timerId = 0;
-  const intervals = [], timeouts = new Map(), elements = new Map(), widgets = [], sockets = [], messages = [], widgetEvents = [], requests = [], clipboard = [];
+  const intervals = [], timeouts = new Map(), elements = new Map(), widgets = [], sockets = [], messages = [], widgetEvents = [], requests = [], clipboard = [], documentListeners = new Map();
   class Element {
     constructor(tag = 'div') {
       this.tagName = tag;
@@ -36,6 +36,7 @@ function browser({ saved = {}, asyncEvents = false, responses = {}, blockPlay = 
     return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), snapshot: () => Object.fromEntries(values) };
   };
   const localStorage = storage(saved);
+  const sessionStorage = storage(session);
   const root = new Element('html');
   function Widget(iframe) {
     const callbacks = new Map();
@@ -87,13 +88,13 @@ function browser({ saved = {}, asyncEvents = false, responses = {}, blockPlay = 
     performance: { now: () => monotonic },
     document: {
       getElementById: element, createElement: (tag) => new Element(tag),
-      createTextNode: (text) => ({ textContent: text }), addEventListener() {},
+      createTextNode: (text) => ({ textContent: text }), addEventListener: (event, callback) => documentListeners.set(event, callback),
       activeElement: null, hidden: false, documentElement: root,
     },
-    localStorage, sessionStorage: storage(),
+    localStorage, sessionStorage,
     location: { protocol: 'http:', origin: 'http://localhost:3000', host: 'localhost:3000', pathname: '/' },
     history: { replaceState() {} },
-    navigator: { clipboard: { writeText: async (value) => clipboard.push(value) } },
+    navigator: { clipboard: { writeText: async (value) => clipboard.push(value) }, locks },
     fetch: async (url, options = {}) => {
       requests.push({ url, options });
       const result = responses[url];
@@ -109,7 +110,8 @@ function browser({ saved = {}, asyncEvents = false, responses = {}, blockPlay = 
   });
   vm.runInContext(source + `
     globalThis.__appTest = {
-      clientId, connect, loadTrack, clearPlayer, reconcile, targetPosition, previewPlaylist, closePlaylist,
+      get clientId() { return clientId; }, get identityReady() { return identityReady; },
+      connect, loadTrack, clearPlayer, reconcile, targetPosition, previewPlaylist, closePlaylist,
       configure(next) {
         if ('room' in next) room = next.room;
         if ('connected' in next) connected = next.connected;
@@ -124,7 +126,8 @@ function browser({ saved = {}, asyncEvents = false, responses = {}, blockPlay = 
   app.configure({ connected: true, audioEnabled: true,
     socket: { readyState: 1, send: (raw) => messages.push(JSON.parse(raw)) } });
   return {
-    app, widgets, sockets, messages, element, localStorage, root, requests, clipboard,
+    app, widgets, sockets, messages, element, localStorage, sessionStorage, root, requests, clipboard,
+    visibility(hidden) { context.document.hidden = hidden; documentListeners.get('visibilitychange')?.(); },
     flushWidgetEvents() { while (widgetEvents.length) widgetEvents.shift()(); },
     discardWidgetEvents() { widgetEvents.length = 0; },
     event(id, type, payload = { preventDefault() {} }) {
@@ -185,6 +188,81 @@ function resolvePositions(widget, position = 10000) {
 function receive(browser, state) {
   browser.sockets[0].emit('message', { data: JSON.stringify({ type: 'state', serverTime: browser.now(), room: state }) });
 }
+
+function sessionLocks() {
+  const held = new Set();
+  return {
+    releaseDocument(clientId) { held.delete(`sc-jams:session:${clientId}`); },
+    request(name, options, callback) {
+      assert.equal(options.ifAvailable, true, 'duplicate detection must never wait for another tab');
+      if (held.has(name)) return Promise.resolve(callback(null));
+      held.add(name);
+      return Promise.resolve(callback({ name })).finally(() => held.delete(name));
+    },
+  };
+}
+
+test('duplicated session storage receives an independent identity before joining', async () => {
+  const locks = sessionLocks();
+  const first = browser({ locks });
+  await first.app.identityReady;
+  const copied = first.sessionStorage.snapshot();
+  const duplicate = browser({ locks, session: copied });
+  duplicate.app.connect();
+  duplicate.sockets[0].emit('open');
+  await duplicate.app.identityReady;
+  const joined = duplicate.messages.find((message) => message.type === 'join');
+  assert.notEqual(joined.clientId, first.app.clientId);
+  assert.equal(joined.clientId, duplicate.app.clientId);
+  assert.notEqual(joined.token, copied['sc-jams:token']);
+  assert.equal(duplicate.sessionStorage.snapshot()['sc-jams:id'], joined.clientId);
+  assert.equal(duplicate.sessionStorage.snapshot()['sc-jams:token'], joined.token);
+  assert.deepEqual(first.sessionStorage.snapshot(), copied, 'the original tab keeps its reconnect credentials');
+});
+
+test('refreshing after document destruction reuses the saved session identity', async () => {
+  const locks = sessionLocks();
+  const first = browser({ locks });
+  await first.app.identityReady;
+  const saved = first.sessionStorage.snapshot();
+  locks.releaseDocument(first.app.clientId);
+  const refreshed = browser({ locks, session: saved });
+  refreshed.app.connect();
+  refreshed.sockets[0].emit('open');
+  await refreshed.app.identityReady;
+  const joined = refreshed.messages.find((message) => message.type === 'join');
+  assert.equal(joined.clientId, first.app.clientId);
+  assert.equal(joined.token, saved['sc-jams:token']);
+});
+
+test('unavailable Web Locks falls back to the saved session without blocking joins', async () => {
+  for (const failure of ['throw', 'reject']) {
+    const session = { 'sc-jams:id': randomUUID(), 'sc-jams:token': randomUUID() };
+    const locks = { request() { if (failure === 'throw') throw new Error('Unavailable'); return Promise.reject(new Error('Unavailable')); } };
+    const b = browser({ session, locks });
+    b.app.connect();
+    b.sockets[0].emit('open');
+    await b.app.identityReady;
+    const joined = b.messages.find((message) => message.type === 'join');
+    assert.equal(joined.clientId, session['sc-jams:id']);
+    assert.equal(joined.token, session['sc-jams:token']);
+  }
+});
+
+test('identity ownership cannot send joins through a superseded or closed socket', async () => {
+  let claim;
+  const locks = { request(name, options, callback) { claim = () => callback({ name }); return new Promise(() => {}); } };
+  const b = browser({ locks });
+  b.app.configure({ room: lobby(b) });
+  b.app.connect();
+  b.sockets[0].emit('open');
+  b.app.connect();
+  b.sockets[1].emit('open');
+  b.sockets[1].emit('close', { code: 1006 });
+  claim();
+  await b.app.identityReady;
+  assert.equal(b.messages.filter((message) => message.type === 'join').length, 0);
+});
 
 test('a late join seeks to the server timeline using the estimated clock offset', () => {
   const b = browser();
@@ -296,6 +374,105 @@ test('native host pause publishes immediately without waiting for a position get
   const pause = b.messages.find((message) => message.type === 'control' && message.action === 'pause');
   assert.equal(pause?.positionMs, 12000);
   assert.equal(b.element('play-button')['aria-label'], 'Play shared track');
+});
+
+test('background player interruptions stay local for hosts and guests', () => {
+  for (const host of [false, true]) for (const playing of [false, true]) {
+    const b = browser();
+    const widget = load(b, lobby(b, { host, playing }));
+    resolvePositions(widget);
+    b.advance(2000);
+    b.messages.length = 0;
+    b.visibility(true);
+    widget.paused = playing;
+    widget.emit(playing ? EVENTS.PAUSE : EVENTS.PLAY, { currentPosition: 12000 });
+    assert.equal(b.messages.filter((message) => message.type === 'control').length, 0, `hidden ${host ? 'host' : 'guest'} must not change shared playback`);
+    assert.equal(b.app.status().pendingIntent, null);
+  }
+});
+
+test('returning to a background-paused tab catches up locally and resumes shared playback', () => {
+  const b = browser();
+  const widget = load(b, lobby(b, { host: true }));
+  resolvePositions(widget);
+  b.advance(2000);
+  b.visibility(true);
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE, { currentPosition: 12000 });
+  b.advance(10000);
+  b.messages.length = 0;
+  widget.calls.length = 0;
+  b.visibility(false);
+  widget.resolvePosition(12000);
+  assert.equal(widget.paused, false);
+  assert.ok(widget.calls.some((call) => call.method === 'seekTo' && call.position === 22000));
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
+  assert.ok(b.messages.some((message) => message.type === 'ping'));
+});
+
+test('a foreground catch-up ignores position getters suspended before switching tabs', () => {
+  const b = browser();
+  const widget = load(b, lobby(b));
+  resolvePositions(widget);
+  b.app.reconcile(true);
+  b.visibility(true);
+  b.advance(10000);
+  b.visibility(false);
+  widget.calls.length = 0;
+  widget.resolvePosition(0);
+  assert.equal(widget.calls.length, 0, 'the old getter cannot seek or change playback');
+  widget.resolvePosition(10000);
+  assert.ok(widget.calls.some((call) => call.method === 'seekTo' && call.position === 20000));
+});
+
+test('hidden hosts never send stale position reports, including getters resumed after returning', () => {
+  const b = browser();
+  const widget = load(b, lobby(b, { host: true }));
+  resolvePositions(widget);
+  b.messages.length = 0;
+  b.interval(5000);
+  assert.equal(widget.pendingPositions.length, 1);
+  b.visibility(true);
+  b.visibility(false);
+  widget.resolvePosition(0);
+  assert.equal(b.messages.filter((message) => message.type === 'position').length, 0);
+  resolvePositions(widget);
+  b.visibility(true);
+  b.interval(5000);
+  assert.equal(widget.pendingPositions.length, 0, 'hidden tabs do not request host timeline corrections');
+});
+
+test('adding an upcoming track preserves the active player and playback timeline', () => {
+  const b = browser();
+  b.app.connect();
+  const initial = lobby(b, { host: true });
+  const widget = load(b, initial);
+  resolvePositions(widget);
+  b.advance(1000);
+  widget.calls.length = 0;
+  b.messages.length = 0;
+  b.element('track-url').value = 'https://soundcloud.com/artist/track-b';
+  b.event('add-form', 'submit');
+  assert.deepEqual(b.messages.find((message) => message.type === 'add'), { type: 'add', url: 'https://soundcloud.com/artist/track-b' });
+  const added = { ...initial, revision: 2, queue: [...initial.queue, track('track-b')] };
+  receive(b, added);
+  resolvePositions(widget, 11000);
+  assert.equal(b.widgets.length, 1);
+  assert.equal(widget.paused, false);
+  assert.equal(widget.calls.filter((call) => ['load', 'pause', 'play', 'seekTo'].includes(call.method)).length, 0, 'queue-only updates leave current audio untouched');
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
+});
+
+test('a connection lost before the first room state can reconnect without a rendering crash', () => {
+  const b = browser();
+  b.app.configure({ room: null, connected: false });
+  b.app.connect();
+  assert.doesNotThrow(() => b.sockets[0].emit('close', { code: 1006 }));
+  assert.equal(b.app.status().connected, false);
+  assert.equal(b.element('play-button').disabled, true);
+  assert.equal(b.hasTimeout(600), true);
+  b.timeout(600);
+  assert.equal(b.sockets.length, 2);
 });
 
 test('a pending widget getter cannot restart playback after the socket closes', () => {

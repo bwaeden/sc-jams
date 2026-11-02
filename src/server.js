@@ -22,12 +22,14 @@ export function createJamServer({
   now = Date.now,
   roomIdleMs = 30 * 60 * 1000,
   cleanupIntervalMs = 30_000,
+  reconnectGraceMs = 15_000,
   maxRooms = 1000,
   random = Math.random,
   publicOrigin = process.env.PUBLIC_ORIGIN,
   lookupTrackMetadata = null,
 } = {}) {
   const creationLimits = new Map();
+  const pendingDisconnects = new Set();
   let closing = false;
   let publicRoot;
   const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024, perMessageDeflate: false });
@@ -194,9 +196,20 @@ export function createJamServer({
         send(socket, { type: 'error', code: error instanceof RoomError ? error.code : 'server_error', message: error instanceof RoomError ? error.message : 'The server could not process this message.', ...(Number.isFinite(error.retryAfterMs) ? { retryAfterMs: Math.max(0, error.retryAfterMs) } : {}) });
       }
     });
-    socket.on('close', () => {
+    socket.on('close', (code) => {
       clearTimeout(joinTimeout);
-      if (session && !closing) store.leave(session.room, session.member, socket);
+      if (!session || closing) return;
+      // A throttled tab or brief network loss must not immediately give away
+      // hosting or pause a solo room. Explicit Leave uses code 1000 instead.
+      if ([1001, 1005, 1006].includes(code) && session.room.hostId === session.member.id) {
+        const timer = setTimeout(() => {
+          pendingDisconnects.delete(timer);
+          // leave ignores this old socket if the same listener has reconnected.
+          store.leave(session.room, session.member, socket);
+        }, reconnectGraceMs);
+        pendingDisconnects.add(timer);
+        timer.unref?.();
+      } else store.leave(session.room, session.member, socket);
     });
   });
 
@@ -224,6 +237,8 @@ export function createJamServer({
     close: () => new Promise((resolve, reject) => {
       closing = true;
       clearInterval(heartbeat);
+      for (const timer of pendingDisconnects) clearTimeout(timer);
+      pendingDisconnects.clear();
       for (const batch of metadataBatches.values()) clearTimeout(batch.timer);
       metadataBatches.clear();
       store.close();

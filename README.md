@@ -2,6 +2,8 @@
 
 Minimal, desktop-first listening rooms for SoundCloud. Create a room, copy the invite, and listen with friends on one page.
 
+[Source on GitHub](https://github.com/bwaeden/sc-jams)
+
 The host controls playback. Everyone can add tracks or import a public playlist. Each listener streams through SoundCloud's official embedded player; the server exchanges room state over WebSockets and never downloads, stores, or relays audio.
 
 This is an experimental prototype. Real browser playback and audible synchronization are still unverified; there is no measured latency guarantee.

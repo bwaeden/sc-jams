@@ -1,0 +1,21 @@
+# One free Node service for friend testing. Rooms are held in this process.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: sc-jams
+    runtime: node
+    region: oregon
+    plan: free
+    numInstances: 1
+    buildCommand: npm ci && npm run check && npm test
+    startCommand: npm start
+    healthCheckPath: /health
+    # Review and deploy updates manually, since each restart clears rooms.
+    autoDeployTrigger: "off"
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0

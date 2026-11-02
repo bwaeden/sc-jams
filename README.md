@@ -74,6 +74,39 @@ When a room expires, connected browsers stop playback, show a closed-room notice
 
 ## Hosting
 
+### Try it online with Render
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/bwaeden/sc-jams)
+
+The included [render.yaml](render.yaml) creates one **Free Node web service** with HTTPS, WebSocket support, and a health check. It installs dependencies, runs the checks and tests, and starts the existing server. No database, SoundCloud API credentials, or custom domain is required.
+
+1. Open **Deploy to Render**, sign in or create a Render account, and review the Blueprint.
+2. Keep the **Free** instance selected and deploy. Render supplies a public `https://…onrender.com` address; use the address shown on your service.
+3. Open that address, create a room, and send its invite to a friend. Room links use the same public address automatically.
+
+Render's [Free web services](https://render.com/docs/free) sleep after 15 minutes without inbound HTTP requests or WebSocket messages, and waking can take about a minute. Active browser connections send regular messages; idle services can still sleep or restart. Rooms and queues disappear whenever the process restarts. Use this plan for friend testing; choose an always-running compute plan when you need a reliable public service.
+
+Automatic code deploys are disabled in the template to avoid clearing rooms on every upstream commit. To update, choose **Manual Deploy → Deploy latest commit** in Render after reviewing the changes. A restart clears rooms, so deploy between listening sessions. Keep a single instance until room storage is shared between servers.
+
+If you create the web service manually from the GitHub repo, select **Node**, use `npm ci && npm run check && npm test` as the build command and `npm start` as the start command, set `HOST=0.0.0.0` and `NODE_VERSION=24`, and use `/health` as the health-check path. Render supplies `PORT`; leave it unset. `PUBLIC_ORIGIN` is optional, but if set it must match the exact public site origin.
+
+GitHub Pages serves [static sites](https://docs.github.com/en/pages/getting-started-with-github-pages/what-is-github-pages), so it cannot run the room server. Serve the frontend and backend together on the Node service for the current app.
+
+### Check a deployed room
+
+Use two desktop browsers or profiles, then repeat with a friend on another network:
+
+- Create a room, open its copied invite, and confirm both people see the same queue and listener list.
+- Import a large playlist, check the 100-track limit, and wait for upcoming titles to fill in before playing them.
+- Check audible alignment, shared play/pause, skipping, automatic advances, and loops. A first audio click can still be required in each browser.
+- Add a third listener and confirm guest skip votes pass only with a majority. Spam a guest's play/pause button and confirm its five-second cooldown clears while the host remains unrestricted.
+- Reorder and shuffle as host, refresh a guest, then close the host's tab and confirm hosting passes immediately to the earliest remaining listener.
+- Check that an empty or paused room closes after 30 minutes. After leaving the free service idle long enough to sleep, test a new visit and expect previous rooms to be gone.
+
+The automated suite tests room state and a simulated player. These public-browser checks establish whether actual audio, autoplay policies, embedded player UI, and network reconnection behave correctly for your listeners.
+
+### Run with Docker
+
 ```sh
 docker compose up --build -d
 ```

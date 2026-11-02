@@ -29,6 +29,9 @@
     'chevron-down': '<path d="m6 9 6 6 6-6"/>',
     'chevron-up': '<path d="m6 15 6-6 6 6"/>',
     'grip-vertical': '<circle cx="9" cy="5" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="19" r="1"/>',
+    repeat: '<path d="m17 2 4 4-4 4M3 11V8a2 2 0 0 1 2-2h16M7 22l-4-4 4-4m14-1v3a2 2 0 0 1-2 2H3"/>',
+    'repeat-1': '<path d="m17 2 4 4-4 4M3 11V8a2 2 0 0 1 2-2h16M7 22l-4-4 4-4m14-1v3a2 2 0 0 1-2 2H3m7-8 2-1v6"/>',
+    shuffle: '<path d="m18 14 4 4-4 4m-8-8L2 22m20-4h-5L7 6H2m16-4 4 4-4 4m4-4h-5l-3 4"/>',
   };
   function svg(name) {
     if (!shapes[name]) return '';

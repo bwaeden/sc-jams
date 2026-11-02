@@ -206,3 +206,45 @@ test('a canceled old exit callback cannot remove a row retained by a newer revis
   assert.equal(q.row('b'), original);
   assert.equal(q.list.children.length, 3);
 });
+
+test('every track keeps its queued-by attribution after its listener leaves', () => {
+  const q = fixture();
+  const queue = [
+    { ...q.tracks[0], addedBy: 'alex', addedByName: 'Alex' },
+    { ...q.tracks[1], addedBy: 'bea', addedByName: 'Bea' },
+  ];
+  q.render({ queue, members: [] });
+  const subtitle = (id) => q.controls(id).select.children[1].children[1].textContent;
+  assert.equal(subtitle('a'), 'Now playing · Added by Alex');
+  assert.equal(subtitle('b'), 'Added by Bea');
+  q.render({ queue, members: [{ id: 'alex', name: 'Renamed listener' }] });
+  assert.equal(subtitle('a'), 'Now playing · Added by Alex', 'the saved attribution identifies who queued the track');
+});
+
+test('legacy attribution and metadata update without replacing queue controls', () => {
+  const q = fixture();
+  q.render({ members: [{ id: 'user', name: 'Alex' }] });
+  const original = q.controls('b');
+  assert.equal(original.select.children[1].children[1].textContent, 'Added by Alex');
+  q.render({ queue: [q.tracks[0], { ...q.tracks[1], title: 'New title' }, q.tracks[2]], members: [{ id: 'user', name: 'Bea' }] });
+  assert.equal(q.controls('b').node, original.node);
+  assert.equal(original.select.children[1].children[0].textContent, 'New title');
+  assert.equal(original.select.children[1].children[1].textContent, 'Added by Bea');
+  q.render({ members: [] });
+  assert.equal(original.select.children[1].children[1].textContent, 'Added by User');
+});
+
+test('queue rotation and repeating a track retain rows without a false exit animation', () => {
+  const q = fixture();
+  q.render();
+  const originals = new Map(q.list.children.map((node) => [node.getAttribute('data-track-id'), node]));
+  const rotated = [q.tracks[1], q.tracks[2], q.tracks[0]];
+  q.render({ queue: rotated, currentTrackId: 'b' });
+  for (const track of rotated) assert.equal(q.row(track.id), originals.get(track.id));
+  assert.deepEqual(q.list.children.map((node) => node.getAttribute('data-track-id')), ['b', 'c', 'a']);
+  assert.ok(q.controls('b').node.classList.contains('current'));
+  assert.ok(!q.controls('a').node.classList.contains('current'));
+  q.render({ queue: rotated, currentTrackId: 'b' });
+  assert.equal(q.row('b'), originals.get('b'), 'a repeated current track reuses its existing row');
+  assert.ok(!q.animations.some((animation) => 'opacity' in animation.keyframes[0]), 'retained looping rows must not fade or collapse');
+});

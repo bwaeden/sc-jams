@@ -4,7 +4,7 @@ Minimal, desktop-first listening rooms for SoundCloud. Create a room, copy the i
 
 [Source on GitHub](https://github.com/bwaeden/sc-jams)
 
-The host controls playback. Everyone can add tracks or import a public playlist. Each listener streams through SoundCloud's official embedded player; the server exchanges room state over WebSockets and never downloads, stores, or relays audio.
+Everyone can add music and pause shared playback. The host resumes, seeks, and manages the queue. Each listener streams through SoundCloud's official embedded player; the server exchanges room state over WebSockets and never downloads, stores, or relays audio.
 
 This is an experimental prototype. Real browser playback and audible synchronization are still unverified; there is no measured latency guarantee.
 
@@ -34,9 +34,19 @@ Use full URLs such as `https://soundcloud.com/artist/track` or `https://soundclo
 
 Playlist import uses the Widget API's `getSounds` result and adds individual public tracks. Duplicate tracks are omitted, and the shared queue holds at most 100 tracks. The preview may expose only part of a large playlist; restricted or unavailable tracks can still fail during playback.
 
-After playback starts, finishing a track automatically starts the next queued track. Finished or skipped tracks leave the queue instead of accumulating as history. Their rows slide upward and collapse briefly; reduced-motion preferences disable the animation. Finishing the last track leaves an empty, paused queue.
+After playback starts, finishing a track automatically starts the next queued track. With repeat off, finished or skipped tracks leave the queue instead of accumulating as history. Their rows slide upward and collapse briefly; reduced-motion preferences disable the animation. A single remaining track repeats until another is queued, then advances on its next completion.
 
-The host can drag upcoming tracks by their handles or use the move-up/move-down buttons. The current track remains first, and reordering does not change playback position. Selecting a different track consumes the current one and plays the selected track in its place while preserving the other upcoming tracks.
+The host can drag upcoming tracks by their handles or use the move-up/move-down buttons. The current track remains first, and reordering does not change playback position. Selecting another track plays it in place of the current one while preserving the other upcoming tracks. With queue repeat enabled, the previous track moves to the back; otherwise it leaves the queue.
+
+The queue shows who added every track, including the current one. The name is captured when the track is queued, so it remains visible after that listener leaves.
+
+## Shared controls and queue modes
+
+In a two-person room, either listener can skip directly. With three or more connected listeners, a guest's skip request casts their vote and opens a compact voting control next to Skip on everyone's screen. Passing requires a strict majority of connected listeners: 2 of 3, 3 of 4, and so on. Each listener gets one vote; disconnected voters are removed and the threshold follows the connected room size. Passing advances immediately and starts the next track unless the room is explicitly waiting. The host can still skip directly or join a vote.
+
+Anyone can pause, while resuming remains the host's action. In shared rooms, four pause/wait requests within ten seconds trigger a ten-second cooldown on the next request. The limit is per listener, persists through reconnects, and does not apply to a host alone in their room. Volume and other controls remain available during the cooldown.
+
+Only the host sees loop and shuffle controls. Loop cycles through **Off**, **Current track**, and **Queue**. Track repeat restarts the same song; queue repeat rotates completed songs to the back. Manual skips bypass track repeat. Shuffle changes only upcoming tracks, leaves the playing track and its position intact, and is available when there are at least two upcoming tracks. Duplicate completion events cannot advance a repeated song twice.
 
 Volume and mute affect only your audio. Volume and the light/dark preference are saved in your browser. The page keeps creation, invites, listeners, the queue, and help together. Footer links open GitHub and the support page in another tab so they do not interrupt a jam.
 
@@ -46,7 +56,7 @@ The support page reads its donation destination from `public/support.json`. Its 
 
 The layout follows the restrained hierarchy of [Linear's interface refresh](https://linear.app/now/behind-the-latest-design-refresh) and the focused controls of [Apple Music MiniPlayer](https://support.apple.com/guide/music-web-review/use-music-miniplayer-apdm333a63ec/web). Icons use a consistent local SVG set based on [Lucide's design principles](https://lucide.dev/contribute/icons/design-principles); no icon fonts, external icon scripts, or text characters are used for transport controls. Lucide and Feather notices are included in `public/icons.LICENSE.txt`.
 
-Shared playback controls are enabled after SoundCloud reports that the player is ready. Host actions from either the site's controls or the SoundCloud embed are sent through the same playback flow. A local action takes effect immediately and remains pending until the server confirms it; older asynchronous position callbacks cannot undo a newer pause or seek. Guest volume remains personal, and guests follow the host's shared playback.
+Shared playback controls are enabled after SoundCloud reports that the player is ready. Host playback actions and guest pauses from either the site's controls or the SoundCloud embed use the same synchronization flow. A local action takes effect immediately and remains pending until the server confirms it; older asynchronous position callbacks cannot undo a newer pause or seek. Guest volume remains personal. Guests cannot resume a room that is paused.
 
 If the host disconnects, their role is reserved for 15 seconds before passing to a connected listener. Invite links have no password: anyone with the link can join and add music.
 

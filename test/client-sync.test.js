@@ -149,10 +149,17 @@ function track(id = 'track-a') {
   return { id, url: `https://soundcloud.com/artist/${id}`, title: id, artist: 'Artist', duration: 240000, addedBy: 'friend' };
 }
 
-function room(browser, { host = false, id = 'track-a', playing = true, position = 10000, updatedAt = browser.now(), revision = 1 } = {}) {
+function room(browser, { host = false, id = 'track-a', playing = true, position = 10000, updatedAt = browser.now(), revision = 1, generation } = {}) {
   return { id: 'AbCdEf123_-Z', revision, hostId: host ? browser.app.clientId : 'another-listener',
     queue: [track(id)], currentTrackId: id, members: [],
-    playback: { playing, positionMs: position, updatedAt } };
+    playback: { playing, positionMs: position, updatedAt, ...(generation === undefined ? {} : { generation }) } };
+}
+function lobby(browser, { host = false, count = 3, ...options } = {}) {
+  const state = room(browser, { host, ...options });
+  state.members = [{ id: browser.app.clientId, name: 'Me', connected: true }];
+  if (!host && count > 1) state.members.push({ id: state.hostId, name: 'Host', connected: true });
+  while (state.members.length < count) state.members.push({ id: `friend-${state.members.length}`, name: 'Friend', connected: true });
+  return state;
 }
 
 function load(browser, state) {
@@ -547,7 +554,7 @@ test('natural finish advances once and the next track starts at READY without wa
   assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
 });
 
-test('the last completed track clears the player and the queue does not restart', () => {
+test('an empty authoritative queue clears the player and does not restart removed audio', () => {
   const b = browser();
   b.app.connect();
   const widget = load(b, room(b, { host: true }));
@@ -827,4 +834,168 @@ test('server acknowledgment during an intent getter cannot leave the sync lock s
   assert.equal(widget.pendingPositions.length, 1, 'future reconciliations are not locked out');
   widget.resolvePosition(10000);
   assert.equal(b.app.status().syncing, false);
+});
+
+test('a guest can pause and the authoritative server position acknowledgment cannot restart it', () => {
+  const b = browser({ asyncEvents: true });
+  b.app.connect();
+  const widget = load(b, lobby(b, { generation: 1 }));
+  resolvePositions(widget);
+  b.flushWidgetEvents();
+  b.messages.length = 0;
+  assert.equal(b.element('play-button').disabled, false);
+  b.app.reconcile();
+  b.event('play-button', 'click');
+  assert.equal(widget.paused, true);
+  assert.equal(b.messages.filter((message) => message.action === 'pause').length, 1);
+  receive(b, lobby(b, { playing: false, position: 18000, revision: 2, generation: 1 }));
+  resolvePositions(widget, 18000);
+  b.flushWidgetEvents();
+  assert.equal(b.app.status().pendingIntent, null);
+  assert.equal(widget.paused, true);
+  assert.equal(b.element('play-button').disabled, true);
+  assert.equal(b.element('play-button')['aria-label'], 'Waiting for host to resume');
+  b.event('play-button', 'click');
+  assert.equal(b.messages.filter((message) => message.action === 'play').length, 0);
+});
+
+test('native guest pause publishes, while natural completion cannot pause the next track', () => {
+  const b = browser({ asyncEvents: true });
+  const widget = load(b, lobby(b));
+  resolvePositions(widget);
+  b.flushWidgetEvents();
+  b.messages.length = 0;
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE, { currentPosition: 12000 });
+  b.flushWidgetEvents();
+  assert.equal(b.messages.filter((message) => message.action === 'pause').length, 1);
+  const ended = browser({ asyncEvents: true });
+  const endedWidget = load(ended, lobby(ended, { position: 239900 }));
+  resolvePositions(endedWidget, 239900);
+  ended.flushWidgetEvents();
+  ended.messages.length = 0;
+  endedWidget.paused = true;
+  endedWidget.emit(EVENTS.PAUSE, { currentPosition: 240000 });
+  endedWidget.emit(EVENTS.FINISH);
+  assert.equal(ended.messages.filter((message) => message.type === 'control').length, 0);
+});
+
+test('skip voting shows counts and own vote state, and the host can vote separately', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b));
+  resolvePositions(widget);
+  b.messages.length = 0;
+  assert.equal(b.element('skip-button')['aria-label'], 'Vote to skip track');
+  b.event('skip-button', 'click');
+  assert.equal(b.messages.at(-1).action, 'skip');
+  assert.equal(widget.paused, false);
+  const voted = lobby(b, { revision: 2 });
+  voted.skipVote = { trackId: 'track-a', voterIds: [b.app.clientId], required: 2, eligibleCount: 3 };
+  receive(b, voted);
+  assert.equal(b.element('skip-vote-panel').hidden, false);
+  assert.equal(b.element('skip-vote-status').textContent, '1 / 2');
+  assert.equal(b.element('skip-button').disabled, true);
+  assert.equal(b.element('vote-skip-button').disabled, true);
+  b.event('skip-button', 'click');
+  assert.equal(b.messages.filter((message) => message.action === 'skip').length, 1);
+  const host = browser();
+  host.app.connect();
+  const hostWidget = load(host, lobby(host, { host: true }));
+  resolvePositions(hostWidget);
+  const pending = lobby(host, { host: true, revision: 2 });
+  pending.skipVote = { trackId: 'track-a', voterIds: ['friend-1'], required: 2, eligibleCount: 3 };
+  receive(host, pending);
+  resolvePositions(hostWidget);
+  host.messages.length = 0;
+  host.event('vote-skip-button', 'click');
+  assert.equal(host.messages.at(-1).action, 'vote_skip');
+  assert.equal(host.element('skip-button').disabled, false);
+});
+
+test('two-person guests can skip directly and a new song clears the vote display', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b, { count: 2 }));
+  resolvePositions(widget);
+  b.messages.length = 0;
+  assert.equal(b.element('skip-button')['aria-label'], 'Skip track');
+  assert.equal(b.element('skip-button').disabled, false);
+  b.event('skip-button', 'click');
+  assert.equal(b.messages.at(-1).action, 'skip');
+  receive(b, lobby(b, { count: 2, id: 'track-b', revision: 2 }));
+  assert.equal(b.element('skip-vote-panel').hidden, true);
+});
+
+test('pause cooldown leaves other controls available and a solo host is exempt', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b, { host: true }));
+  resolvePositions(widget);
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 10000 }) });
+  assert.equal(b.element('play-button').disabled, true);
+  assert.equal(b.element('skip-button').disabled, false);
+  assert.equal(b.element('volume').disabled, false);
+  receive(b, lobby(b, { host: true, count: 1, revision: 2 }));
+  resolvePositions(widget);
+  assert.equal(b.element('play-button').disabled, false);
+  b.messages.length = 0;
+  b.event('play-button', 'click');
+  assert.equal(b.messages.filter((message) => message.action === 'pause').length, 1);
+});
+
+test('repeat and shuffle are host-only controls with authoritative room actions', () => {
+  const b = browser();
+  b.app.connect();
+  const state = lobby(b, { host: true });
+  state.queue.push(track('track-b'), track('track-c'));
+  const widget = load(b, state);
+  resolvePositions(widget);
+  assert.equal(b.element('repeat-button').hidden, false);
+  assert.equal(b.element('shuffle-button').hidden, false);
+  b.messages.length = 0;
+  b.event('repeat-button', 'click');
+  assert.equal(b.messages.at(-1).mode, 'track');
+  receive(b, { ...state, revision: 2, repeatMode: 'track' });
+  resolvePositions(widget);
+  assert.equal(b.element('repeat-button')['aria-pressed'], 'true');
+  b.event('repeat-button', 'click');
+  assert.equal(b.messages.at(-1).mode, 'queue');
+  b.event('shuffle-button', 'click');
+  assert.equal(b.messages.at(-1).action, 'shuffle');
+  const guest = browser();
+  const guestWidget = load(guest, lobby(guest));
+  resolvePositions(guestWidget);
+  assert.equal(guest.element('repeat-button').hidden, true);
+  assert.equal(guest.element('shuffle-button').hidden, true);
+  guest.messages.length = 0;
+  guest.event('repeat-button', 'click');
+  guest.event('shuffle-button', 'click');
+  assert.equal(guest.messages.filter((message) => message.type === 'control').length, 0);
+});
+
+test('same-track generations restart a looping song and reject old completion callbacks', () => {
+  const b = browser({ asyncEvents: true });
+  b.app.connect();
+  const first = load(b, lobby(b, { host: true, generation: 10 }));
+  resolvePositions(first);
+  b.flushWidgetEvents();
+  b.messages.length = 0;
+  first.emit(EVENTS.FINISH);
+  first.emit(EVENTS.FINISH);
+  assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
+  assert.equal(b.messages.find((message) => message.action === 'finish').generation, 10);
+  receive(b, lobby(b, { host: true, position: 0, revision: 2, generation: 11 }));
+  const restarted = b.widgets.at(-1);
+  assert.notEqual(restarted, first);
+  restarted.emit(EVENTS.READY);
+  assert.equal(restarted.paused, false);
+  first.emit(EVENTS.FINISH);
+  assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
+  resolvePositions(restarted, 0);
+  b.flushWidgetEvents();
+  restarted.emit(EVENTS.FINISH);
+  restarted.emit(EVENTS.FINISH);
+  assert.equal(b.messages.filter((message) => message.action === 'finish').length, 2);
+  assert.equal(b.messages.filter((message) => message.action === 'finish').at(-1).generation, 11);
 });

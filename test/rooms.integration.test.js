@@ -320,12 +320,13 @@ test('finishing consumes the old track, keeps the next playing, and ignores dupl
   assert.equal(unchanged.room.revision, advanced.room.revision + 1, 'only witness join should increment the revision');
   host.send({ type: 'control', action: 'finish', trackId: secondId });
   await guest.state((room) => room.currentTrackId === thirdId);
-  host.send({ type: 'control', action: 'finish', trackId: thirdId });
-  const ended = await guest.state((room) => room.currentTrackId === null);
-  assert.deepEqual(ended.room.queue, []);
-  assert.equal(ended.room.playback.playing, false);
-  assert.equal(ended.room.playback.positionMs, 0);
-  host.send({ type: 'control', action: 'finish', trackId: thirdId });
+  const last = await host.state((room) => room.currentTrackId === thirdId);
+  host.send({ type: 'control', action: 'finish', trackId: thirdId, generation: last.room.playback.generation });
+  const repeated = await guest.state((room) => room.currentTrackId === thirdId && room.playback.generation > last.room.playback.generation);
+  assert.equal(repeated.room.queue.length, 1);
+  assert.equal(repeated.room.playback.playing, true);
+  assert.equal(repeated.room.playback.positionMs, 0);
+  host.send({ type: 'control', action: 'finish', trackId: thirdId, generation: last.room.playback.generation });
   host.send({ type: 'ping', sentAt: 7702 });
   await host.waitFor((message) => message.type === 'pong' && message.sentAt === 7702);
 });
@@ -371,6 +372,25 @@ test('only the host can reorder upcoming tracks without changing the playback ti
   host.send({ type: 'control', action: 'finish', trackId: ids[0] });
   const next = await guest.state((room) => room.currentTrackId === ids[2]);
   assert.equal(next.room.playback.playing, true);
+});
+
+test('selecting another track during queue repeat preserves every queued song', async (t) => {
+  const { host } = await fixture(t);
+  const queued = await addQueue(host, 3);
+  const [firstId, secondId, thirdId] = queued.room.queue.map((track) => track.id);
+  host.send({ type: 'control', action: 'repeat', mode: 'queue' });
+  await host.state((room) => room.repeatMode === 'queue');
+  host.send({ type: 'control', action: 'play', positionMs: 12000 });
+  const playing = await host.state((room) => room.playback.playing);
+  host.send({ type: 'control', action: 'select', trackId: thirdId });
+  const selected = await host.state((room) => room.currentTrackId === thirdId);
+  assert.deepEqual(selected.room.queue.map((track) => track.id), [thirdId, secondId, firstId]);
+  assert.equal(selected.room.playback.positionMs, 0);
+  assert.equal(selected.room.playback.generation, playing.room.playback.generation + 1);
+  assert.equal(selected.room.playback.playing, true);
+  host.send({ type: 'control', action: 'remove', trackId: thirdId });
+  const removed = await host.state((room) => room.currentTrackId === secondId);
+  assert.deepEqual(removed.room.queue.map((track) => track.id), [secondId, firstId]);
 });
 
 test('invalid queue permutations cannot duplicate, lose, or move the current track', async (t) => {
@@ -529,4 +549,209 @@ test('HTTP only exposes public assets and rejects unknown rooms', async (t) => {
     const response = await fetch(origin + path);
     assert.ok([400, 403, 404].includes(response.status), `${path} returned ${response.status}`);
   }
+});
+
+async function addQueue(host, count = 3) {
+  host.send({ type: 'add_many', tracks: Array.from({ length: count }, (_, index) => ({ url: `https://soundcloud.com/artist/track-${index}` })) });
+  return host.state((room) => room.queue.length === count);
+}
+
+let barrierSerial = 10_000;
+async function barrier(peer) {
+  const sentAt = ++barrierSerial;
+  peer.send({ type: 'ping', sentAt });
+  await peer.waitFor((message) => message.type === 'pong' && message.sentAt === sentAt);
+}
+
+test('guest pause uses the server timeline, is spam-limited, and solo hosts remain exempt', async (t) => {
+  let timestamp = 10_000;
+  const { roomId, host, connect } = await fixture(t, { now: () => timestamp });
+  const queued = await addQueue(host, 2);
+  const guest = connect({ name: 'Pausing friend' });
+  await guest.join(roomId);
+  host.send({ type: 'control', action: 'play', positionMs: 5000 });
+  const playing = await host.state((room) => room.playback.playing);
+  timestamp += 2000;
+  guest.send({ type: 'control', action: 'pause', positionMs: 999999 });
+  let paused = await host.state((room) => !room.playback.playing && room.revision > playing.room.revision);
+  assert.equal(paused.room.playback.positionMs, 7000, 'guest offsets cannot seek the shared song');
+  assert.equal(paused.room.playback.generation, queued.room.playback.generation);
+  for (let index = 0; index < 3; index++) {
+    guest.send({ type: 'control', action: 'pause' });
+    paused = await host.state((room) => room.revision > paused.room.revision);
+  }
+  guest.send({ type: 'control', action: 'pause' });
+  const limited = await guest.waitFor((message) => message.type === 'error');
+  assert.equal(limited.code, 'pause_rate_limited');
+  assert.equal(limited.retryAfterMs, 10000);
+  // The other person has a separate allowance, including when that person hosts.
+  for (let index = 0; index < 4; index++) {
+    host.send({ type: 'control', action: 'pause' });
+    paused = await host.state((room) => room.revision > paused.room.revision);
+  }
+  host.send({ type: 'control', action: 'pause' });
+  assert.equal((await host.waitFor((message) => message.type === 'error')).code, 'pause_rate_limited');
+  guest.close();
+  paused = await host.state((room) => room.members.filter((member) => member.connected).length === 1 && room.revision > paused.room.revision);
+  for (let index = 0; index < 7; index++) {
+    host.send({ type: 'control', action: 'pause' });
+    paused = await host.state((room) => room.revision > paused.room.revision);
+  }
+  timestamp += 10001;
+  const rejoined = connect(guest.identity);
+  await rejoined.join(roomId);
+  rejoined.send({ type: 'control', action: 'pause' });
+  await rejoined.state((room) => room.revision > paused.room.revision + 1);
+});
+
+test('either listener in a two-person room skips directly and starts the next track', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  const queued = await addQueue(host, 3);
+  const guest = connect();
+  await guest.join(roomId);
+  guest.send({ type: 'control', action: 'skip', trackId: queued.room.currentTrackId, generation: queued.room.playback.generation });
+  const skipped = await host.state((room) => room.currentTrackId === queued.room.queue[1].id);
+  assert.equal(skipped.room.skipVote, null);
+  assert.equal(skipped.room.playback.playing, true);
+  assert.equal(skipped.room.queue.length, 2);
+});
+
+test('three-person skip voting counts each identity once and a majority overrides the host', async (t) => {
+  const { app, roomId, host, connect } = await fixture(t);
+  const queued = await addQueue(host, 3);
+  const first = connect({ name: 'First voter' }), second = connect({ name: 'Second voter' });
+  await first.join(roomId);
+  await second.join(roomId);
+  const skip = { type: 'control', action: 'skip', trackId: queued.room.currentTrackId, generation: queued.room.playback.generation };
+  first.send(skip);
+  const vote = await host.state((room) => room.skipVote?.voterIds.length === 1);
+  assert.equal(vote.room.skipVote.required, 2);
+  assert.equal(vote.room.skipVote.eligibleCount, 3);
+  assert.equal(vote.room.currentTrackId, queued.room.currentTrackId);
+  first.send(skip);
+  await barrier(first);
+  assert.equal(app.rooms.get(roomId).revision, vote.room.revision, 'duplicate yes clicks are idempotent');
+  second.send({ ...skip, action: 'vote_skip' });
+  const advanced = await host.state((room) => room.currentTrackId === queued.room.queue[1].id);
+  assert.equal(advanced.room.playback.playing, true);
+  assert.equal(advanced.room.skipVote, null);
+  assert.equal(advanced.room.queue.length, 2);
+  second.send(skip);
+  await barrier(second);
+  assert.equal(app.rooms.get(roomId).currentTrackId, advanced.room.currentTrackId, 'old votes cannot skip the new song');
+});
+
+test('a four-person lobby needs three votes, and joining or leaving recomputes eligibility', async (t) => {
+  const { app, roomId, host, connect } = await fixture(t);
+  const queued = await addQueue(host, 3);
+  const first = connect(), second = connect(), fourth = connect();
+  await first.join(roomId);
+  await second.join(roomId);
+  await fourth.join(roomId);
+  first.send({ type: 'control', action: 'skip', trackId: queued.room.currentTrackId });
+  await host.state((room) => room.skipVote?.required === 3);
+  second.send({ type: 'control', action: 'vote_skip', trackId: queued.room.currentTrackId });
+  const twoVotes = await host.state((room) => room.skipVote?.voterIds.length === 2);
+  assert.equal(twoVotes.room.currentTrackId, queued.room.currentTrackId);
+  const fifth = connect();
+  await fifth.join(roomId);
+  assert.equal(app.rooms.get(roomId).skipVote.voterIds.size, 2);
+  first.close();
+  const voteRemoved = await host.state((room) => room.skipVote?.voterIds.length === 1);
+  assert.equal(voteRemoved.room.skipVote.required, 3);
+  fifth.close();
+  await host.state((room) => room.skipVote?.eligibleCount === 3);
+  fourth.close();
+  const advanced = await host.state((room) => room.currentTrackId === queued.room.queue[1].id);
+  assert.equal(advanced.room.playback.playing, true);
+  assert.equal(advanced.room.skipVote, null);
+});
+
+test('the host can contribute a vote without forcing an immediate skip', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  const queued = await addQueue(host, 3);
+  const first = connect(), second = connect(), third = connect();
+  await first.join(roomId); await second.join(roomId); await third.join(roomId);
+  first.send({ type: 'control', action: 'skip', trackId: queued.room.currentTrackId });
+  await host.state((room) => room.skipVote?.voterIds.length === 1);
+  host.send({ type: 'control', action: 'vote_skip', trackId: queued.room.currentTrackId });
+  const voted = await second.state((room) => room.skipVote?.voterIds.length === 2);
+  assert.equal(voted.room.currentTrackId, queued.room.currentTrackId);
+  host.send({ type: 'control', action: 'skip', trackId: queued.room.currentTrackId });
+  const advanced = await second.state((room) => room.currentTrackId === queued.room.queue[1].id);
+  assert.equal(advanced.room.skipVote, null);
+});
+
+test('single-track autoplay restarts until another track is added and rejects old-generation finish events', async (t) => {
+  const { app, roomId, host } = await fixture(t);
+  const queued = await addQueue(host, 1);
+  host.send({ type: 'control', action: 'play' });
+  await host.state((room) => room.playback.playing);
+  const finish = { type: 'control', action: 'finish', trackId: queued.room.currentTrackId, generation: queued.room.playback.generation };
+  host.send(finish);
+  const repeated = await host.state((room) => room.playback.generation > finish.generation);
+  assert.equal(repeated.room.currentTrackId, finish.trackId);
+  assert.equal(repeated.room.queue.length, 1);
+  assert.equal(repeated.room.playback.playing, true);
+  host.send(finish);
+  await barrier(host);
+  assert.equal(app.rooms.get(roomId).playback.generation, repeated.room.playback.generation);
+  host.send({ type: 'add', url: TRACK_B });
+  const withNext = await host.state((room) => room.queue.length === 2);
+  host.send({ ...finish, generation: withNext.room.playback.generation });
+  const advanced = await host.state((room) => room.currentTrackId === withNext.room.queue[1].id);
+  assert.equal(advanced.room.queue.length, 1);
+  assert.equal(advanced.room.playback.playing, true);
+});
+
+test('host repeat modes loop the track or cycle the queue while explicit skip bypasses track repeat', async (t) => {
+  const { roomId, host, connect } = await fixture(t);
+  const queued = await addQueue(host, 3);
+  const guest = connect();
+  await guest.join(roomId);
+  for (const action of [{ action: 'repeat', mode: 'track' }, { action: 'shuffle' }]) {
+    guest.send({ type: 'control', ...action });
+    assert.equal((await guest.waitFor((message) => message.type === 'error')).code, 'host_only');
+  }
+  host.send({ type: 'control', action: 'repeat', mode: 'track' });
+  await host.state((room) => room.repeatMode === 'track');
+  host.send({ type: 'control', action: 'play' });
+  await host.state((room) => room.playback.playing);
+  host.send({ type: 'control', action: 'finish', trackId: queued.room.currentTrackId, generation: queued.room.playback.generation });
+  const repeated = await host.state((room) => room.playback.generation > queued.room.playback.generation);
+  assert.equal(repeated.room.currentTrackId, queued.room.currentTrackId);
+  assert.deepEqual(repeated.room.queue.map((track) => track.id), queued.room.queue.map((track) => track.id));
+  host.send({ type: 'control', action: 'skip', trackId: repeated.room.currentTrackId, generation: repeated.room.playback.generation });
+  const skipped = await host.state((room) => room.currentTrackId === queued.room.queue[1].id);
+  host.send({ type: 'control', action: 'repeat', mode: 'queue' });
+  await host.state((room) => room.repeatMode === 'queue');
+  host.send({ type: 'control', action: 'finish', trackId: skipped.room.currentTrackId, generation: skipped.room.playback.generation });
+  const cycled = await host.state((room) => room.currentTrackId === queued.room.queue[2].id);
+  assert.deepEqual(cycled.room.queue.map((track) => track.id), [queued.room.queue[2].id, queued.room.queue[1].id]);
+  assert.equal(cycled.room.playback.playing, true);
+});
+
+test('shuffle changes only upcoming order and queue attribution survives departure or forged metadata', async (t) => {
+  const { roomId, host, connect } = await fixture(t, { random: () => 0.99 });
+  const queued = await addQueue(host, 4);
+  const guest = connect({ name: 'Queued by Alex' });
+  await guest.join(roomId);
+  guest.send({ type: 'add', url: TRACK_B });
+  const added = await host.state((room) => room.queue.length === 5);
+  const theirs = added.room.queue[4];
+  assert.equal(theirs.addedByName, 'Queued by Alex');
+  guest.close();
+  await host.state((room) => room.members.some((member) => member.id === guest.identity.clientId && !member.connected));
+  host.send({ type: 'metadata', trackId: theirs.id, title: 'Metadata title', addedByName: 'Forged attribution', addedBy: host.identity.clientId });
+  const metadataState = await host.state((room) => room.queue.some((track) => track.title === 'Metadata title'));
+  host.send({ type: 'control', action: 'play', positionMs: 12000 });
+  const playing = await host.state((room) => room.playback.playing);
+  host.send({ type: 'control', action: 'shuffle' });
+  const shuffled = await host.state((room) => room.revision > playing.room.revision);
+  assert.equal(shuffled.room.currentTrackId, queued.room.currentTrackId);
+  assert.equal(shuffled.room.queue[0].id, queued.room.currentTrackId);
+  assert.notDeepEqual(shuffled.room.queue.map((track) => track.id), metadataState.room.queue.map((track) => track.id));
+  assert.deepEqual([...shuffled.room.queue.map((track) => track.id)].sort(), [...playing.room.queue.map((track) => track.id)].sort());
+  assert.deepEqual(shuffled.room.playback, playing.room.playback);
+  assert.equal(shuffled.room.queue.find((track) => track.id === theirs.id).addedByName, 'Queued by Alex');
 });

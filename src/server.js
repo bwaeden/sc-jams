@@ -23,6 +23,7 @@ export function createJamServer({
   roomIdleMs = 2 * 60 * 60 * 1000,
   memberGraceMs = 120_000,
   maxRooms = 1000,
+  random = Math.random,
   publicOrigin = process.env.PUBLIC_ORIGIN,
 } = {}) {
   const creationLimits = new Map();
@@ -36,7 +37,7 @@ export function createJamServer({
     socket.send(JSON.stringify(message));
   }
 
-  const store = createRoomStore({ now, hostGraceMs, roomIdleMs, memberGraceMs, maxRooms, onChange: (room) => {
+  const store = createRoomStore({ now, hostGraceMs, roomIdleMs, memberGraceMs, maxRooms, random, onChange: (room) => {
     const message = { type: 'state', serverTime: now(), room: store.snapshot(room) };
     for (const member of room.members.values()) if (member.connected) send(member.socket, message);
   } });
@@ -152,7 +153,7 @@ export function createJamServer({
         }
         store.apply(session.room, session.member, message);
       } catch (error) {
-        send(socket, { type: 'error', code: error instanceof RoomError ? error.code : 'server_error', message: error instanceof RoomError ? error.message : 'The server could not process this message.' });
+        send(socket, { type: 'error', code: error instanceof RoomError ? error.code : 'server_error', message: error instanceof RoomError ? error.message : 'The server could not process this message.', ...(Number.isFinite(error.retryAfterMs) ? { retryAfterMs: Math.max(0, error.retryAfterMs) } : {}) });
       }
     });
     socket.on('close', () => {

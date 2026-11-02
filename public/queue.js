@@ -118,9 +118,9 @@
     }
     if (!active) text(row.number, String(index + 1).padStart(2, '0'));
     const title = track.title || track.url.split('/').at(-1).replaceAll('-', ' ');
-    const contributor = state.members?.find((member) => member.id === track.addedBy)?.name || 'User';
+    const contributor = track.addedByName || state.members?.find((member) => member.id === track.addedBy)?.name || 'User';
     text(row.title, title);
-    text(row.contributor, active ? 'Now playing' : `Added by ${contributor}`);
+    text(row.contributor, active ? `Now playing · Added by ${contributor}` : `Added by ${contributor}`);
     row.select.disabled = !state.isHost || !state.connected || active;
     row.select.title = active ? 'Currently playing' : state.isHost ? 'Play this track next' : 'The host selects tracks';
     row.grip.hidden = !state.isHost || active;

@@ -4,9 +4,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_DURATION = 24 * 60 * 60 * 1000;
 
 export class RoomError extends Error {
-  constructor(code, message) {
+  constructor(code, message, details = {}) {
     super(message);
     this.code = code;
+    Object.assign(this, details);
   }
 }
 
@@ -43,7 +44,7 @@ function newTrack(value, member) {
   requireValue(value && typeof value === 'object' && !Array.isArray(value), 'invalid_track', 'Each playlist item must be a SoundCloud track.');
   const url = normalizeTrackUrl(value.url);
   const parts = new URL(url).pathname.split('/').filter(Boolean);
-  return { id: randomUUID(), url, title: parts[1].replace(/-/g, ' '), artist: parts[0], artwork: null, duration: 0, addedBy: member.id, ...metadata(value) };
+  return { id: randomUUID(), url, title: parts[1].replace(/-/g, ' '), artist: parts[0], artwork: null, duration: 0, addedBy: member.id, addedByName: member.name, ...metadata(value) };
 }
 
 export function getPosition(room, at = Date.now()) {
@@ -74,6 +75,7 @@ export function createRoomStore({
   roomIdleMs = 2 * 60 * 60 * 1000,
   memberGraceMs = 120_000,
   maxRooms = 1000,
+  random = Math.random,
   onChange = () => {},
 } = {}) {
   const rooms = new Map();
@@ -107,7 +109,7 @@ export function createRoomStore({
     do { id = randomBytes(9).toString('base64url'); } while (rooms.has(id));
     const timestamp = now();
     const room = { id, revision: 0, hostId: null, members: new Map(), queue: [], currentTrackId: null,
-      playback: { playing: false, positionMs: 0, updatedAt: timestamp }, hold: null, createdAt: timestamp, lastActive: timestamp };
+      playback: { playing: false, positionMs: 0, updatedAt: timestamp, generation: 0 }, repeatMode: 'off', skipVote: null, hold: null, createdAt: timestamp, lastActive: timestamp };
     rooms.set(id, room);
     return room;
   }
@@ -122,7 +124,9 @@ export function createRoomStore({
     return { id: room.id, revision: room.revision, hostId: room.hostId,
       members: [...room.members.values()].map(({ id, name, connected }) => ({ id, name, connected })),
       queue: room.queue.map((track) => ({ ...track })), currentTrackId: room.currentTrackId,
-      playback: { ...room.playback }, hold: room.hold ? { ...room.hold, waiters: room.hold.waiters.map((waiter) => ({ ...waiter })) } : null };
+      playback: { ...room.playback }, repeatMode: room.repeatMode,
+      skipVote: room.skipVote ? { trackId: room.skipVote.trackId, generation: room.skipVote.generation, voterIds: [...room.skipVote.voterIds], required: Math.floor(connectedMembers(room).length / 2) + 1, eligibleCount: connectedMembers(room).length } : null,
+      hold: room.hold ? { ...room.hold, waiters: room.hold.waiters.map((waiter) => ({ ...waiter })) } : null };
   }
 
   function join(roomId, { clientId, token, name }, socket) {
@@ -149,6 +153,7 @@ export function createRoomStore({
       room.members.set(clientId, member);
     }
     if (!room.hostId) room.hostId = clientId;
+    reconcileVote(room);
     changed(room);
     return { room, member };
   }
@@ -157,6 +162,7 @@ export function createRoomStore({
     if (!rooms.has(room.id) || member.socket !== socket) return;
     member.socket = null;
     member.connected = false;
+    reconcileVote(room);
     // A departed listener must not leave the whole room waiting indefinitely.
     const waiter = room.hold?.waiters.find((item) => item.memberId === member.id);
     if (waiter) waiter.ready = true;
@@ -188,15 +194,68 @@ export function createRoomStore({
 
   function select(room, trackId, playing = room.playback.playing) {
     room.currentTrackId = trackId;
-    room.playback = { playing: Boolean(trackId && playing && !room.hold), positionMs: 0, updatedAt: now() };
+    room.playback = { playing: Boolean(trackId && playing && !room.hold), positionMs: 0, updatedAt: now(), generation: room.playback.generation + 1 };
+    room.skipVote = null;
     if (!trackId) room.hold = null;
   }
 
-  function advance(room) {
-    const playing = room.playback.playing;
+  function advance(room, { natural = false, forcePlaying = false } = {}) {
+    const playing = forcePlaying || room.playback.playing;
     const index = room.queue.findIndex((track) => track.id === room.currentTrackId);
-    if (index >= 0) room.queue.splice(index, 1);
+    if (index < 0) return;
+    if (room.queue.length === 1 || (natural && room.repeatMode === 'track')) {
+      select(room, room.currentTrackId, playing);
+      return;
+    }
+    const [previous] = room.queue.splice(index, 1);
+    if (room.repeatMode === 'queue') room.queue.push(previous);
     select(room, room.queue[0]?.id ?? null, playing);
+  }
+
+  function connectedMembers(room) {
+    return [...room.members.values()].filter((member) => member.connected);
+  }
+
+  function reconcileVote(room) {
+    const vote = room.skipVote;
+    if (!vote) return;
+    if (vote.trackId !== room.currentTrackId || vote.generation !== room.playback.generation) { room.skipVote = null; return; }
+    const members = connectedMembers(room);
+    const eligible = new Set(members.map((member) => member.id));
+    vote.voterIds = new Set([...vote.voterIds].filter((id) => eligible.has(id)));
+    if (!vote.voterIds.size) { room.skipVote = null; return; }
+    if (members.length <= 2 || vote.voterIds.size >= Math.floor(members.length / 2) + 1) advance(room, { forcePlaying: true });
+  }
+
+  function requestSkip(room, member, { voteOnly = false } = {}) {
+    const members = connectedMembers(room);
+    if (!voteOnly && (room.hostId === member.id || members.length <= 2)) {
+      advance(room, { forcePlaying: true });
+      return true;
+    }
+    room.skipVote ??= { trackId: room.currentTrackId, generation: room.playback.generation, voterIds: new Set() };
+    if (room.skipVote.voterIds.has(member.id)) return false;
+    room.skipVote.voterIds.add(member.id);
+    reconcileVote(room);
+    return true;
+  }
+
+  function limitPause(room, member) {
+    if (connectedMembers(room).length <= 1 && room.hostId === member.id) {
+      member.pauseAttempts = [];
+      member.pauseBlockedUntil = 0;
+      return;
+    }
+    const timestamp = now();
+    if (member.pauseBlockedUntil > timestamp) {
+      throw new RoomError('pause_rate_limited', 'Pausing is on cooldown. Please give the room a moment.', { retryAfterMs: member.pauseBlockedUntil - timestamp });
+    }
+    member.pauseAttempts = (member.pauseAttempts || []).filter((at) => timestamp - at < 10_000);
+    if (member.pauseAttempts.length >= 4) {
+      member.pauseBlockedUntil = timestamp + 10_000;
+      throw new RoomError('pause_rate_limited', 'Pausing is on cooldown. Please give the room a moment.', { retryAfterMs: 10_000 });
+    }
+    member.pauseAttempts.push(timestamp);
   }
 
   function apply(room, member, message) {
@@ -223,9 +282,10 @@ export function createRoomStore({
       if (!room.currentTrackId) select(room, additions[0].id, false);
     } else if (message.type === 'hold') {
       requireValue(room.currentTrackId, 'empty_queue', 'Add a track before asking the room to wait.');
+      limitPause(room, member);
       const at = now();
       const wasPlaying = room.playback.playing;
-      room.playback = { playing: false, positionMs: getPosition(room, at), updatedAt: at };
+      room.playback = { ...room.playback, playing: false, positionMs: getPosition(room, at), updatedAt: at };
       room.hold ??= { memberId: member.id, name: member.name, reason: 'manual', at, wasPlaying, waiters: [] };
       const waiter = room.hold.waiters.find((item) => item.memberId === member.id);
       if (waiter) { waiter.name = member.name; waiter.ready = false; }
@@ -255,15 +315,42 @@ export function createRoomStore({
       requireValue(message.playing === room.playback.playing, 'stale_playback', 'Playback changed. Sync to the current room state.');
       const next = position(message.positionMs);
       const track = room.queue.find((item) => item.id === room.currentTrackId);
-      room.playback = { playing: room.playback.playing, positionMs: Math.min(next, track.duration || MAX_DURATION), updatedAt: now() };
+      room.playback = { ...room.playback, playing: room.playback.playing, positionMs: Math.min(next, track.duration || MAX_DURATION), updatedAt: now() };
     } else if (message.type === 'control') {
-      requireHost(room, member);
+      requireValue(typeof message.action === 'string', 'invalid_action', 'Choose a valid playback action.');
+      if (!['pause', 'skip', 'vote_skip'].includes(message.action)) requireHost(room, member);
       const currentIndex = room.queue.findIndex((track) => track.id === room.currentTrackId);
-      if (message.action === 'select') {
+      if (message.action === 'pause') {
+        requireValue(currentIndex >= 0, 'empty_queue', 'Add a track to start listening.');
+        limitPause(room, member);
+        const at = now();
+        // A guest can pause the room but cannot move its authoritative timeline.
+        const next = room.hostId === member.id && message.positionMs !== undefined ? position(message.positionMs) : getPosition(room, at);
+        const duration = room.queue[currentIndex].duration || MAX_DURATION;
+        room.playback = { ...room.playback, playing: false, positionMs: Math.min(next, duration), updatedAt: at };
+      } else if (message.action === 'repeat') {
+        requireValue(['off', 'track', 'queue'].includes(message.mode), 'invalid_repeat', 'Choose off, track, or queue repeat.');
+        if (room.repeatMode === message.mode) return;
+        room.repeatMode = message.mode;
+      } else if (message.action === 'shuffle') {
+        const start = room.currentTrackId ? 1 : 0;
+        if (room.queue.length - start < 2) return;
+        const currentOrder = room.queue.map((track) => track.id);
+        for (let index = room.queue.length - 1; index > start; index--) {
+          const target = start + Math.min(index - start, Math.max(0, Math.floor(random() * (index - start + 1))));
+          [room.queue[index], room.queue[target]] = [room.queue[target], room.queue[index]];
+        }
+        // Make a shuffle click observable even if Fisher-Yates picked identity.
+        if (room.queue.every((track, index) => track.id === currentOrder[index])) [room.queue[start], room.queue[start + 1]] = [room.queue[start + 1], room.queue[start]];
+      } else if (message.action === 'select') {
         requireValue(room.queue.some((track) => track.id === message.trackId), 'track_not_found', 'This track is no longer in the queue.');
         if (message.trackId !== room.currentTrackId) {
-          // Selecting an upcoming track starts it now and consumes the old one.
-          if (currentIndex >= 0) room.queue.splice(currentIndex, 1);
+          // Queue repeat retains the old current track at the back; other modes
+          // consume it when the host jumps to another track.
+          if (currentIndex >= 0) {
+            const [previous] = room.queue.splice(currentIndex, 1);
+            if (room.repeatMode === 'queue') room.queue.push(previous);
+          }
           const index = room.queue.findIndex((track) => track.id === message.trackId);
           const [selected] = room.queue.splice(index, 1);
           room.queue.unshift(selected);
@@ -283,20 +370,22 @@ export function createRoomStore({
         const removingCurrent = message.trackId === room.currentTrackId;
         room.queue.splice(index, 1);
         if (removingCurrent) select(room, room.queue[0]?.id ?? null);
-      } else if (message.action === 'skip' || message.action === 'finish') {
+      } else if (message.action === 'skip' || message.action === 'vote_skip' || message.action === 'finish') {
         // Iframe callbacks can arrive twice or after a track switch. Never let
         // an old completion consume the new current track.
         if (message.action === 'finish' && (message.trackId !== room.currentTrackId || !room.playback.playing || room.hold)) return;
-        if (message.action === 'skip' && message.trackId !== undefined && message.trackId !== room.currentTrackId) return;
+        if (message.action !== 'finish' && message.trackId !== undefined && message.trackId !== room.currentTrackId) return;
+        if (message.generation !== undefined && message.generation !== room.playback.generation) return;
         requireValue(currentIndex >= 0, 'empty_queue', 'Add a track to start listening.');
-        advance(room);
+        if (message.action === 'finish') advance(room, { natural: true });
+        else if (!requestSkip(room, member, { voteOnly: message.action === 'vote_skip' })) return;
       } else {
         requireValue(currentIndex >= 0, 'empty_queue', 'Add a track to start listening.');
         const current = room.queue[currentIndex];
         const nextPosition = message.positionMs === undefined ? getPosition(room, now()) : position(message.positionMs);
-        requireValue(['play', 'pause', 'seek'].includes(message.action), 'invalid_action', 'Choose a valid playback action.');
+        requireValue(['play', 'seek'].includes(message.action), 'invalid_action', 'Choose a valid playback action.');
         if (message.action === 'play') requireValue(!room.hold?.waiters.some((waiter) => !waiter.ready), 'room_waiting', 'The room is waiting. Everyone must choose “I’m ready” before you resume.');
-        room.playback = { playing: message.action === 'play' ? true : message.action === 'pause' ? false : room.playback.playing,
+        room.playback = { ...room.playback, playing: message.action === 'play' ? true : room.playback.playing,
           positionMs: Math.min(nextPosition, current.duration || MAX_DURATION), updatedAt: now() };
         if (message.action === 'play') room.hold = null;
       }

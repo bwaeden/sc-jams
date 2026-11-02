@@ -1,0 +1,16 @@
+{
+  "name": "sidecar-soundcloud-jam",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Small, self-hostable listening rooms for SoundCloud.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "check": "node --check src/server.js && node --check src/rooms.js && node --check public/app.js"
+  },
+  "dependencies": { "ws": "^8.18.3" }
+}

@@ -1,0 +1,13 @@
+node_modules
+.git
+.env
+.env.*
+!.env.example
+test
+coverage
+*.log
+*.zip
+*.tar
+*.tar.gz
+screenshots
+.openai

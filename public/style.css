@@ -132,7 +132,6 @@ input[type="range"]:disabled { cursor: not-allowed; opacity: .3; }
 .listeners-label svg { width: 16px; height: 16px; }
 .people { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .person { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; line-height: 1.5; }
-.person.away { opacity: .5; }
 .avatar { display: grid; place-items: center; width: 25px; height: 25px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 50%; color: var(--muted); font-size: 11px; }
 .person-name { max-width: 115px; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
 .host-tag { color: var(--muted); font-size: 9px; font-weight: 500; letter-spacing: .2px; }

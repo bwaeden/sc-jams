@@ -164,3 +164,24 @@ test('the app footer links directly to the real GitHub repo and support page', (
   }
   assert.match(read('support.html'), /id="donation-link"/);
 });
+
+test('the app markup provides every control requested by its client code', () => {
+  const elements = pageElements(read('index.html'));
+  const requestedIds = new Set([...read('app.js').matchAll(/\$\('([^']+)'\)/g)].map((match) => match[1]));
+  assert.ok(requestedIds.size > 20, 'the audit must inspect the real client control references');
+  for (const id of requestedIds) assert.ok(elements.has(id), `app.js requests a missing HTML control: ${id}`);
+});
+
+test('room closure has a return action and removed waiting controls are absent', () => {
+  const elements = pageElements(read('index.html'));
+  assert.equal(elements.has('wait-button'), false);
+  assert.equal(elements.has('local-ad-button'), false);
+  const closed = elements.get('room-closed-view');
+  assert.ok(closed, 'an inactive room has a dedicated closed view');
+  assert.equal(closed.hidden, true, 'room closure must not appear before the server closes the room');
+  assert.ok(elements.has('room-closed-message'));
+  const newRoom = elements.get('new-room-button');
+  assert.ok(newRoom, 'a closed room has a way back to room creation');
+  assert.equal(newRoom.tagName, 'BUTTON');
+  assert.equal(newRoom.getAttribute('type'), 'button');
+});

@@ -20,7 +20,7 @@ $('join-name').value = initialName;
 let socket, room, roomId, displayName, reconnectTimer, pingTimer, heartbeatTimer;
 let reconnectDelay = 600, stopped = false, connected = false;
 let clockOffset = 0, clockSamples = [], lastRevision = -1, joinedOnce = false;
-let widget, loadedTrackId, loadedPlaybackGeneration = null, playerReady = false, loadGeneration = 0;
+let widget, loadedTrackId, loadedPlaybackGeneration = null, playerReady = false, loadGeneration = 0, widgetSourceUrl = null;
 let audioEnabled = false, syncing = false, lastCorrection = 0;
 let pendingForce = false, syncAttempt = 0;
 let pendingIntent = null, intentSerial = 0, widgetEchoes = [];
@@ -33,15 +33,14 @@ if (!Number.isFinite(volume)) volume = 70;
 volume = Math.max(0, Math.min(100, volume));
 let unmutedVolume = volume || 70;
 let playlistWidget, playlistGeneration = 0, playlistTracks = [], playlistTimer;
-let waitingLocally = false;
-let localAdPlaying = false, pendingHold = null, finishingTrackId = null, endPauseTimer;
+let finishingTrackId = null, endPauseTimer;
 let finishingPlaybackGeneration = null, pauseBlockedUntil = 0, pauseCooldownTimer;
+let autoplayProbeTimer, needsAudioClick = false, finishCheck = null;
+let transitionConfirmUntil = 0, lastProgressPosition = null, lastProgressAt = -Infinity;
 const isHost = () => room?.hostId === clientId;
 const serverNow = () => Date.now() + clockOffset;
 const currentTrack = () => room?.queue.find((track) => track.id === room.currentTrackId);
-const playbackState = () => pendingHold && pendingHold.trackId === room?.currentTrackId ? pendingHold : pendingIntent?.trackId === room?.currentTrackId ? pendingIntent : room?.playback;
-const isHeld = () => Boolean(pendingHold || room?.hold) && !pendingIntent?.playing;
-const unreadyWaiters = () => room?.hold?.waiters?.filter((member) => !member.ready) || [];
+const playbackState = () => pendingIntent?.trackId === room?.currentTrackId ? pendingIntent : room?.playback;
 const playbackGeneration = () => room?.playback?.generation ?? 0;
 const listenerCount = () => room?.members?.filter((member) => member.connected).length || 1;
 const pauseCoolingDown = () => !(isHost() && listenerCount() === 1) && serverNow() < pauseBlockedUntil;
@@ -75,65 +74,105 @@ function consumeWidgetEvent(type, positionMs) {
   return true;
 }
 function handleNativePlayback(playing, event = {}) {
+  if (finishingTrackId === room?.currentTrackId) return;
+  if (finishCheck) { finishCheck.nativeEvent = { playing, event }; return; }
   const position = Number.isFinite(event.currentPosition) ? event.currentPosition : lastPosition;
   const echoed = consumeWidgetEvent(playing ? 'PLAY' : 'PAUSE');
-  if (finishingTrackId === room?.currentTrackId) return;
-  if (isHeld()) {
-    lastWidgetPlaying = playing;
-    if (playing && !localAdPlaying) commandPlayback(false);
-    return;
-  }
-  // A player may emit PAUSE just before FINISH. Give FINISH a brief chance to
-  // consume the track instead of broadcasting a pause that stops the next one.
-  if (!playing && !echoed && playbackState()?.playing && knownDuration > 0 && position >= knownDuration - 350) {
-    clearTimeout(endPauseTimer);
-    invalidateReconcile();
-    nativeCheck = null;
-    const trackId = loadedTrackId;
-    endPauseTimer = setTimeout(() => {
-      endPauseTimer = null;
-      if (room?.currentTrackId === trackId && !finishingTrackId && !isHeld()) hostIntent('pause', position, false);
-    }, 180);
-    return;
-  }
-  const commit = (actualPlaying) => {
+  const commit = (actualPlaying, actualPosition = position) => {
     lastWidgetPlaying = actualPlaying;
-    if (actualPlaying) { audioEnabled = true; $('enable-audio').hidden = true; }
-    if (eventsAllowed(actualPlaying ? 'play' : 'pause') && playbackState().playing !== actualPlaying) hostIntent(actualPlaying ? 'play' : 'pause', position, false);
-    else if (!isHost() && room?.playback.playing !== actualPlaying) setTimeout(() => reconcile(true), 50);
+    if (!actualPlaying) audioEnabled = false;
+    if (actualPlaying) confirmPlaying();
+    // Natural endings can emit PAUSE before FINISH. Scope the grace period to
+    // this load, so a delayed ending cannot pause a newly started song or loop.
+    if (!actualPlaying && playbackState()?.playing && knownDuration > 0 && actualPosition >= knownDuration - 350) {
+      clearTimeout(endPauseTimer);
+      invalidateReconcile();
+      nativeCheck = null;
+      const generation = loadGeneration;
+      endPauseTimer = setTimeout(() => {
+        endPauseTimer = null;
+        if (generation === loadGeneration && !finishingTrackId && !finishCheck) hostIntent('pause', actualPosition, false);
+      }, 180);
+      return;
+    }
+    if (eventsAllowed(actualPlaying ? 'play' : 'pause') && playbackState().playing !== actualPlaying) hostIntent(actualPlaying ? 'play' : 'pause', actualPosition, false);
+    else if (room?.playback.playing !== actualPlaying) setTimeout(() => reconcile(true), 50);
   };
   if (echoed && playing === playbackState()?.playing) {
     if (!nativeCheck) lastWidgetPlaying = playing;
+    if (playing) confirmPlaying();
     return;
   }
-  if (!echoed) { nativeCheck = null; commit(playing); return; }
-  // An event matching an older command may instead be a fresh native click.
-  // Ask for actual play state only in this ambiguous case, while preventing a
-  // sync loop from undoing the click. Never guess from a time suppression window.
+  if (!echoed && performance.now() > transitionConfirmUntil) { nativeCheck = null; commit(playing); return; }
+  // During loads and when an old command echo overlaps a native click, verify
+  // the actual state before publishing. A late old PAUSE must not stop new audio.
   invalidateReconcile();
   const check = { instance: widget, generation: loadGeneration };
   nativeCheck = check;
   const valid = () => nativeCheck === check && check.instance === widget && check.generation === loadGeneration && connected;
   widget.isPaused((paused) => {
     if (!valid()) return;
-    nativeCheck = null;
-    if (!paused === playing) commit(playing);
-    else {
+    if (!paused !== playing) {
+      nativeCheck = null;
       lastWidgetPlaying = !paused;
       if (!paused !== playbackState()?.playing) reconcile(true);
+      return;
     }
+    // End positions carried by delayed events belong to the old source. Read
+    // the new source's position only in that ambiguous near-end case.
+    if (paused && position >= knownDuration - 350 && performance.now() <= transitionConfirmUntil) {
+      widget.getPosition((actualPosition) => {
+        if (!valid()) return;
+        nativeCheck = null;
+        commit(false, actualPosition);
+      });
+    } else { nativeCheck = null; commit(playing); }
   });
   setTimeout(() => {
     if (!valid()) return;
     nativeCheck = null;
-    commit(playing);
+    reconcile(true);
   }, 1500);
 }
 function commandPlayback(playing) {
   if (!widget || !playerReady) return;
   if (lastWidgetPlaying !== playing) expectWidgetEvent(playing ? 'PLAY' : 'PAUSE');
   lastWidgetPlaying = playing;
-  if (playing) widget.play(); else widget.pause();
+  if (playing) {
+    needsAudioClick = false;
+    widget.play();
+    observeAutoplay();
+  } else {
+    audioEnabled = false;
+    clearTimeout(autoplayProbeTimer);
+    needsAudioClick = false;
+    widget.pause();
+  }
+}
+function confirmPlaying() {
+  audioEnabled = true;
+  needsAudioClick = false;
+  clearTimeout(autoplayProbeTimer);
+  $('enable-audio').hidden = true;
+  renderControls();
+}
+function observeAutoplay() {
+  clearTimeout(autoplayProbeTimer);
+  const instance = widget, generation = loadGeneration;
+  autoplayProbeTimer = setTimeout(() => {
+    if (instance !== widget || generation !== loadGeneration || !connected || !playbackState()?.playing) return;
+    instance.isPaused((paused) => {
+      if (instance !== widget || generation !== loadGeneration || !connected || !playbackState()?.playing) return;
+      if (paused) {
+        audioEnabled = false;
+        lastWidgetPlaying = false;
+        needsAudioClick = true;
+        $('enable-audio').hidden = false;
+        renderControls();
+        setSync('Your browser needs a click to start audio', true);
+      } else confirmPlaying();
+    });
+  }, 700);
 }
 function commandSeek(positionMs) {
   if (!widget || !playerReady) return;
@@ -143,11 +182,11 @@ function commandSeek(positionMs) {
   widget.seekTo(positionMs);
 }
 function hostIntent(action, positionMs, commandPlayer = true) {
-  if ((!isHost() && action !== 'pause') || !connected || !playerReady || !currentTrack() || waitingLocally) return;
-  if (action === 'pause' && pauseCoolingDown()) { reconcile(true); return; }
-  if (action === 'play' && (pendingHold || unreadyWaiters().length)) return;
+  if ((!isHost() && !['play', 'pause'].includes(action)) || !connected || !playerReady || !currentTrack()) return;
+  if (['play', 'pause'].includes(action) && pauseCoolingDown()) { reconcile(true); return; }
   const previous = playbackState();
   nativeCheck = null;
+  finishCheck = null;
   const playing = action === 'play' ? true : action === 'pause' ? false : previous.playing;
   const position = Math.max(0, Math.min(knownDuration || 86400000, Number(positionMs) || 0));
   pendingIntent = { trackId: room.currentTrackId, playing, positionMs: position, updatedAt: serverNow(), baseRevision: room.revision, serial: ++intentSerial };
@@ -171,7 +210,7 @@ function hostIntent(action, positionMs, commandPlayer = true) {
 function finishCurrentTrack() {
   const trackId = room?.currentTrackId;
   const generation = playbackGeneration();
-  if (!trackId || !connected || isHeld() || !playbackState()?.playing || (finishingTrackId === trackId && finishingPlaybackGeneration === generation)) return;
+  if (!trackId || !connected || !playbackState()?.playing || (finishingTrackId === trackId && finishingPlaybackGeneration === generation)) return;
   clearTimeout(endPauseTimer);
   endPauseTimer = null;
   nativeCheck = null;
@@ -266,7 +305,7 @@ function previewPlaylist(url) {
   iframe.title = 'SoundCloud playlist import preview';
   iframe.height = '166';
   iframe.scrolling = 'no';
-  iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(url)}&auto_play=false&color=%23f5613c&show_comments=false&visual=false`;
+  iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(url)}&auto_play=false&single_active=false&color=%23f5613c&show_comments=false&visual=false`;
   $('playlist-preview').replaceChildren(iframe);
   const instance = window.SC.Widget(iframe);
   playlistWidget = instance;
@@ -314,6 +353,7 @@ function showJoin(id) {
   $('landing').hidden = true;
   $('room-view').hidden = true;
   $('join-overlay').hidden = false;
+  $('room-closed-view').hidden = true;
   $('join-name').focus();
 }
 function openRoom(id, name) {
@@ -326,6 +366,7 @@ function openRoom(id, name) {
   $('landing').hidden = true;
   $('join-overlay').hidden = true;
   $('room-view').hidden = false;
+  $('room-closed-view').hidden = true;
   document.title = 'sc jams';
   stopped = false;
   connect();
@@ -344,6 +385,10 @@ function connect() {
     if (socket !== next) return;
     let message;
     try { message = JSON.parse(data); } catch { return; }
+    if (message.type === 'room_closed') {
+      closeRoom(message.message || 'This room closed after 30 minutes without playback.');
+      return;
+    }
     if (message.type === 'pong') {
       const rtt = Date.now() - message.sentAt;
       if (rtt >= 0 && rtt < 5000) {
@@ -359,13 +404,6 @@ function connect() {
         clearTimeout(pauseCooldownTimer);
         pauseCooldownTimer = setTimeout(() => { pauseBlockedUntil = 0; renderControls(); }, Math.max(0, pauseBlockedUntil - serverNow()));
         toast(message.message);
-      }
-      if (pendingHold) {
-        pendingHold = null;
-        waitingLocally = false;
-        localAdPlaying = false;
-        renderControls();
-        reconcile(true);
       }
       if (pendingIntent) { clearIntent(); invalidateReconcile(); renderControls(); reconcile(true); }
       errorAt('queue-error', message.message);
@@ -388,13 +426,11 @@ function connect() {
     const previousGeneration = playbackGeneration();
     const timelineChanged = room?.playback.updatedAt !== message.room.playback.updatedAt || room?.playback.positionMs !== message.room.playback.positionMs;
     const firstState = !connected;
-    if (message.room.hold || (pendingHold && message.room.currentTrackId !== pendingHold.trackId)) pendingHold = null;
-    if (message.room.hold) { nativeCheck = null; clearIntent(); }
     if (pendingIntent) {
       const state = message.room;
       const expected = pendingIntent.positionMs + (pendingIntent.playing ? state.playback.updatedAt - pendingIntent.updatedAt : 0);
-      const acknowledged = state.revision > pendingIntent.baseRevision && state.playback.playing === pendingIntent.playing && ((!isHost() && !pendingIntent.playing) || Math.abs(state.playback.positionMs - expected) < 2000);
-      if (acknowledged || state.currentTrackId !== pendingIntent.trackId || (pendingIntent.playing && state.hostId !== clientId) || state.hold) clearIntent();
+      const acknowledged = state.revision > pendingIntent.baseRevision && state.playback.playing === pendingIntent.playing && (!isHost() || Math.abs(state.playback.positionMs - expected) < 2000);
+      if (acknowledged || state.currentTrackId !== pendingIntent.trackId) clearIntent();
     }
     if (!clockSamples.length) clockOffset = message.serverTime - Date.now();
     room = message.room;
@@ -403,11 +439,6 @@ function connect() {
     reconnectDelay = 600;
     connectionLabel('Connected', true);
     renderRoom();
-    if (isHeld() && !localAdPlaying) {
-      nativeCheck = null;
-      invalidateReconcile();
-      commandPlayback(false);
-    }
     if (firstState) {
       clearInterval(pingTimer);
       const ping = () => send({ type: 'ping', sentAt: Date.now() });
@@ -426,13 +457,20 @@ function connect() {
     const track = currentTrack();
     if (track && (previousTrack !== track.id || loadedTrackId !== track.id || previousGeneration !== playbackGeneration())) loadTrack(track, previousGeneration !== playbackGeneration());
     else if (!track) clearPlayer();
-    else if (playerReady) reconcile(timelineChanged || previousPlaying !== room.playback.playing || firstState);
+    else if (playerReady) {
+      if (timelineChanged || previousPlaying !== room.playback.playing || firstState) {
+        invalidateReconcile();
+        nativeCheck = null;
+        if (!playbackState().playing) commandPlayback(false);
+        else if (!needsAudioClick) commandPlayback(true);
+      }
+      reconcile(timelineChanged || previousPlaying !== room.playback.playing || firstState);
+    }
   });
   next.addEventListener('close', (event) => {
     if (socket !== next) return;
+    if (event.code === 4004) { closeRoom('This room closed after 30 minutes without playback.'); return; }
     connected = false;
-    pendingHold = null;
-    localAdPlaying = false;
     finishingTrackId = null;
     finishingPlaybackGeneration = null;
     nativeCheck = null;
@@ -442,6 +480,9 @@ function connect() {
     pendingForce = false;
     syncAttempt++;
     clearInterval(pingTimer);
+    clearTimeout(autoplayProbeTimer);
+    lastProgressAt = -Infinity;
+    lastProgressPosition = null;
     if (widget && playerReady) {
       commandPlayback(false);
       lastWidgetPlaying = false;
@@ -470,16 +511,12 @@ function el(tag, className, text) {
 }
 function renderRoom() {
   $('room-subtitle').textContent = isHost() ? 'You’re hosting' : 'Listening together';
-  const waiter = room.hold?.waiters?.find((member) => member.memberId === clientId);
-  if ((!room.hold && !pendingHold) || waiter?.ready) { waitingLocally = false; localAdPlaying = false; }
-  else if (waiter || room.hold?.memberId === clientId) waitingLocally = true;
   $('people-count').textContent = room.members.filter((member) => member.connected).length;
-  $('people').replaceChildren(...room.members.map((member, index) => {
-    const item = el('li', `person${member.connected ? '' : ' away'}`);
+  $('people').replaceChildren(...room.members.filter((member) => member.connected !== false).map((member, index) => {
+    const item = el('li', 'person');
     const avatar = el('span', `avatar avatar-${index % 4}`, member.name.slice(0, 1).toUpperCase());
     item.append(avatar, el('span', 'person-name', member.name + (member.id === clientId ? ' (you)' : '')));
     if (member.id === room.hostId) item.append(el('span', 'host-tag', 'HOST'));
-    if (!member.connected) item.append(el('span', 'host-tag', 'AWAY'));
     return item;
   }));
   $('queue-count').textContent = room.queue.length;
@@ -529,9 +566,9 @@ function renderRoom() {
 }
 function renderControls() {
   const track = currentTrack();
-  const available = Boolean(track && connected && playerReady && !playerUnavailable && !waitingLocally && !pendingHold && !unreadyWaiters().length);
+  const available = Boolean(track && connected && playerReady && !playerUnavailable);
   const playing = playbackState()?.playing;
-  const controls = available && (playing ? !pauseCoolingDown() : isHost());
+  const controls = available && !pauseCoolingDown();
   $('play-button').disabled = !controls;
   const skipAvailable = Boolean(track && connected && playerReady);
   const vote = room?.skipVote?.trackId === room?.currentTrackId ? room.skipVote : null;
@@ -550,8 +587,8 @@ function renderControls() {
   $('add-button').disabled = !connected;
   $('import-playlist-button').disabled = !connected || !playlistTracks.length;
   $('play-icon').innerHTML = icon(playing ? 'pause' : 'play');
-  $('play-button').setAttribute('aria-label', playing ? pauseCoolingDown() ? 'Pause is cooling down' : 'Pause shared track' : isHost() ? 'Play shared track' : 'Waiting for host to resume');
-  $('play-button').title = playing ? pauseCoolingDown() ? 'Pause is temporarily cooling down' : 'Pause shared track' : isHost() ? 'Play shared track' : 'The host resumes playback';
+  $('play-button').setAttribute('aria-label', pauseCoolingDown() ? 'Play and pause are cooling down' : playing ? 'Pause shared track' : 'Play shared track');
+  $('play-button').title = pauseCoolingDown() ? 'Play and pause are temporarily cooling down' : playing ? 'Pause shared track' : 'Play shared track';
   const repeatMode = room?.repeatMode || 'off';
   const repeatLabel = repeatMode === 'track' ? 'Loop current track' : repeatMode === 'queue' ? 'Loop queue' : 'Loop off';
   $('repeat-button').hidden = !isHost();
@@ -562,23 +599,15 @@ function renderControls() {
   $('repeat-button').title = repeatLabel;
   $('shuffle-button').hidden = !isHost();
   $('shuffle-button').disabled = !connected || (room?.queue.length || 0) < 3;
-  $('playback-label').textContent = track ? !playerReady ? 'Loading player' : playerUnavailable ? 'Unavailable' : playing ? 'Playing' : 'Paused' : '';
-  const waiting = room?.hold?.waiters?.filter((member) => !member.ready).map((member) => member.name) || (room?.hold ? [room.hold.name] : []);
-  const ownWaiter = room?.hold?.waiters?.find((member) => member.memberId === clientId);
-  $('role-hint').textContent = pendingHold ? 'Pausing the room…' : room?.hold ? waiting.length ? `Paused · waiting for ${waiting.join(', ')}` : 'Everyone is ready. Host can resume.' : pauseCoolingDown() ? 'Pause is cooling down. Other controls still work.' : 'Anyone can pause. The host resumes.';
-  $('wait-button').textContent = waitingLocally ? 'I’m ready' : ownWaiter?.ready ? 'Ready' : 'Wait for me';
-  $('wait-button').disabled = !track || !connected || Boolean(ownWaiter?.ready) || Boolean(pendingHold);
-  $('local-ad-button').hidden = !waitingLocally || !isHeld();
-  $('local-ad-button').disabled = !connected || !playerReady || playerUnavailable;
-  $('local-ad-button').textContent = localAdPlaying ? 'Pause my audio' : 'Let my ad finish';
-  $('local-ad-button').setAttribute('aria-pressed', String(localAdPlaying));
+  $('playback-label').textContent = track ? !playerReady ? 'Loading player' : playerUnavailable ? 'Unavailable' : playing ? needsAudioClick ? 'Click to listen' : audioEnabled ? 'Playing' : 'Starting' : 'Paused' : '';
+  $('role-hint').textContent = pauseCoolingDown() ? 'Play and pause are cooling down. Other controls still work.' : 'Everyone can play and pause.';
   $('volume').disabled = false;
   $('resync-button').hidden = !track;
-  $('resync-button').disabled = waitingLocally || !playerReady || !connected || playerUnavailable;
-  $('enable-audio').hidden = !track || audioEnabled;
+  $('resync-button').disabled = !playerReady || !connected || playerUnavailable;
+  $('enable-audio').hidden = !track || !playbackState()?.playing || !needsAudioClick;
   $('enable-audio').disabled = !playerReady || !connected || playerUnavailable;
 }
-function eventsAllowed(action = 'pause') { return (isHost() || action === 'pause') && connected && playerReady && !isHeld() && !finishingTrackId; }
+function eventsAllowed(action = 'pause') { return (isHost() || ['play', 'pause'].includes(action)) && connected && playerReady && !finishingTrackId; }
 function clearPlayer() {
   loadGeneration++;
   nativeCheck = null;
@@ -588,12 +617,19 @@ function clearPlayer() {
   pendingForce = false;
   syncAttempt++;
   playerReady = false;
+  audioEnabled = false;
   loadedTrackId = null;
+  widgetSourceUrl = null;
   loadedPlaybackGeneration = null;
   finishingTrackId = null;
   finishingPlaybackGeneration = null;
   clearTimeout(endPauseTimer);
   endPauseTimer = null;
+  clearTimeout(autoplayProbeTimer);
+  needsAudioClick = false;
+  finishCheck = null;
+  lastProgressAt = -Infinity;
+  lastProgressPosition = null;
   if (widget) widget.pause();
   widget = null;
   knownDuration = 0;
@@ -605,89 +641,103 @@ function clearPlayer() {
 }
 function loadTrack(track, force = false) {
   if (loadedTrackId === track.id && !force && loadedPlaybackGeneration === playbackGeneration()) return;
+  const previousInstance = widget;
+  const previousReady = playerReady;
+  const sameTrack = loadedTrackId === track.id && widgetSourceUrl === track.url;
   const generation = ++loadGeneration;
   finishingTrackId = null;
   finishingPlaybackGeneration = null;
+  finishCheck = null;
   clearTimeout(endPauseTimer);
+  clearTimeout(autoplayProbeTimer);
   endPauseTimer = null;
   nativeCheck = null;
   clearIntent();
   widgetEchoes = [];
-  syncing = false;
-  pendingForce = false;
-  syncAttempt++;
   loadedTrackId = track.id;
   loadedPlaybackGeneration = playbackGeneration();
   playerReady = false;
   playerUnavailable = false;
+  audioEnabled = false;
+  needsAudioClick = false;
   knownDuration = track.duration || 0;
   lastPosition = 0;
+  lastPositionAt = performance.now();
   lastWidgetPlaying = false;
-  if (widget) widget.pause();
-  widget = null;
+  lastProgressPosition = null;
+  lastProgressAt = -Infinity;
+  if (previousInstance) {
+    previousInstance.pause();
+    for (const name of Object.values(window.SC.Widget.Events)) previousInstance.unbind(name);
+  }
   $('empty-player').hidden = true;
   $('active-player').hidden = false;
   renderControls();
   errorAt('player-error');
   setSync('Getting the track ready');
-  const iframe = document.createElement('iframe');
-  iframe.title = 'SoundCloud track player';
-  iframe.allow = 'autoplay';
-  iframe.height = '166';
-  iframe.scrolling = 'no';
-  const continuePlaying = audioEnabled && room?.playback.playing && !isHeld();
-  iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(track.url)}&auto_play=${continuePlaying}&single_active=false&color=%23f5613c&hide_related=true&show_comments=false&show_user=true&show_reposts=false&visual=false`;
-  $('embed-container').replaceChildren(iframe);
+  let iframe;
+  if (!previousInstance) {
+    widgetSourceUrl = track.url;
+    iframe = document.createElement('iframe');
+    iframe.title = 'SoundCloud track player';
+    iframe.allow = 'autoplay';
+    iframe.height = '166';
+    iframe.scrolling = 'no';
+    iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(track.url)}&auto_play=${Boolean(room?.playback.playing)}&single_active=false&color=%23f5613c&hide_related=true&show_comments=false&show_user=true&show_reposts=false&visual=false`;
+    $('embed-container').replaceChildren(iframe);
+  }
   function bindWidget(attempt = 0) {
     if (generation !== loadGeneration) return;
     if (!window.SC?.Widget) {
       if (attempt < 40) { setTimeout(() => bindWidget(attempt + 1), 250); return; }
-      errorAt('player-error', 'The SoundCloud player could not load. Check your connection or allow SoundCloud in your browser’s privacy settings.');
+      errorAt('player-error', 'The SoundCloud player could not load. Check your connection or allow SoundCloud in your browser privacy settings.');
       setSync('Player unavailable', true);
       playerUnavailable = true;
       renderControls();
       return;
     }
-    const instance = window.SC.Widget(iframe);
+    const instance = previousInstance || window.SC.Widget(iframe);
     widget = instance;
     const events = window.SC.Widget.Events;
     const valid = () => generation === loadGeneration && widget === instance;
-    instance.bind(events.READY, () => {
-      if (!valid()) return;
+    const ready = () => {
+      if (!valid() || playerReady) return;
       playerReady = true;
-      renderControls();
+      transitionConfirmUntil = performance.now() + 1000;
       applyVolume();
-      if (audioEnabled && playbackState()?.playing && !isHeld()) commandPlayback(true);
+      if (sameTrack) commandSeek(targetPosition());
+      if (playbackState()?.playing) commandPlayback(true);
+      else commandPlayback(false);
+      renderControls();
       instance.getDuration((duration) => { if (valid()) { knownDuration = duration || 0; renderControls(); } });
       instance.getCurrentSound((sound) => {
         if (!valid() || !sound) return;
+        if (sound.permalink_url) {
+          try { if (canonicalTrack(sound.permalink_url) !== track.url) return; } catch { return; }
+        }
         $('track-title').textContent = sound.title || 'SoundCloud track';
         $('track-artist').textContent = sound.user?.username || 'SoundCloud';
         if (isHost()) send({ type: 'metadata', trackId: track.id, title: sound.title, artist: sound.user?.username, artwork: sound.artwork_url, duration: sound.duration });
       });
       reconcile(true);
-    });
+    };
     instance.bind(events.PLAY_PROGRESS, (event) => {
-      if (!valid()) return;
-      lastPosition = event.currentPosition || 0;
+      if (!valid() || !playerReady) return;
+      const position = Number(event.currentPosition) || 0;
+      if (lastProgressPosition !== null && position > lastProgressPosition) lastProgressAt = performance.now();
+      lastProgressPosition = position;
+      lastPosition = position;
       lastPositionAt = performance.now();
-      if (lastPosition > 0 && room?.playback.playing) {
-        audioEnabled = true;
-        $('enable-audio').hidden = true;
-      }
+      if (position > 0 && playbackState()?.playing) confirmPlaying();
     });
     instance.bind(events.PLAY, (event = {}) => {
-      if (!valid()) return;
-      handleNativePlayback(true, event);
+      if (valid() && playerReady) handleNativePlayback(true, event);
     });
     instance.bind(events.PAUSE, (event = {}) => {
-      if (!valid()) return;
-      // Native controls are user input too. Publish immediately: waiting for a
-      // getter here let a periodic sync restart a genuinely paused host player.
-      handleNativePlayback(false, event);
+      if (valid() && playerReady) handleNativePlayback(false, event);
     });
     instance.bind(events.SEEK, (event) => {
-      if (!valid()) return;
+      if (!valid() || !playerReady) return;
       lastPosition = event.currentPosition || 0;
       lastPositionAt = performance.now();
       if (consumeWidgetEvent('SEEK', lastPosition)) return;
@@ -695,16 +745,64 @@ function loadTrack(track, force = false) {
       else if (!isHost()) setTimeout(() => reconcile(true), 100);
     });
     instance.bind(events.FINISH, () => {
-      if (valid()) finishCurrentTrack();
+      if (!valid() || !playerReady || !connected || !playbackState()?.playing || finishCheck || finishingTrackId === track.id) return;
+      clearTimeout(endPauseTimer);
+      endPauseTimer = null;
+      nativeCheck = null;
+      invalidateReconcile();
+      const recentEnd = knownDuration > 0 && lastProgressPosition >= knownDuration - 350 && performance.now() - lastProgressAt < 2000;
+      const check = { instance, generation };
+      finishCheck = check;
+      instance.getPosition((position) => {
+        if (finishCheck !== check || !valid() || !connected) return;
+        finishCheck = null;
+        // Reused widgets can deliver a previous song's FINISH after load/seek.
+        // Only the current audio actually reaching its end may advance a queue.
+        if (playbackState()?.playing && (recentEnd || (knownDuration ? position >= knownDuration - 350 : position > 0))) finishCurrentTrack();
+        else if (check.nativeEvent) handleNativePlayback(check.nativeEvent.playing, check.nativeEvent.event);
+      });
+      setTimeout(() => {
+        if (finishCheck !== check || !valid()) return;
+        finishCheck = null;
+        if (check.nativeEvent) handleNativePlayback(check.nativeEvent.playing, check.nativeEvent.event);
+        reconcile(true);
+      }, 2000);
     });
     instance.bind(events.ERROR, () => {
       if (!valid()) return;
       playerUnavailable = true;
+      clearTimeout(autoplayProbeTimer);
       invalidateReconcile();
       renderControls();
-      errorAt('player-error', 'SoundCloud couldn’t play this track here. It may be restricted or embedding may be disabled. The host can skip it.');
+      errorAt('player-error', 'SoundCloud could not play this track here. It may be restricted or embedding may be disabled. Skip it or try another track.');
       setSync('Track unavailable on this device', true);
     });
+    if (previousInstance) {
+      if (sameTrack && previousReady) ready();
+      else if (sameTrack) instance.bind(events.READY, ready);
+      else {
+        const loadSource = () => {
+          if (!valid()) return;
+          widgetSourceUrl = track.url;
+          instance.load(track.url, { auto_play: Boolean(playbackState()?.playing), single_active: false, show_comments: false, visual: false, callback: () => {
+            if (!valid()) return;
+            instance.getCurrentSound((sound) => {
+              if (!valid()) return;
+              if (sound?.permalink_url) {
+                try { if (canonicalTrack(sound.permalink_url) !== track.url) return; } catch { return; }
+              }
+              ready();
+            });
+          } });
+        };
+        if (previousReady) loadSource();
+        else instance.bind(events.READY, () => {
+          if (!valid()) return;
+          instance.unbind(events.READY);
+          loadSource();
+        });
+      }
+    } else instance.bind(events.READY, ready);
   }
   bindWidget();
   setTimeout(() => {
@@ -716,20 +814,14 @@ function loadTrack(track, force = false) {
   }, 18000);
 }
 function reconcile(force = false) {
-  if (finishingTrackId === room?.currentTrackId || endPauseTimer) return;
-  if (isHeld()) {
-    if (localAdPlaying) { setSync('Only your audio is playing · the room is paused', true); return; }
-    commandPlayback(false);
-    setSync('Room paused while listeners get ready', true);
-    return;
-  }
+  if (finishingTrackId === room?.currentTrackId || endPauseTimer || finishCheck) return;
   if (nativeCheck) return;
   if (!widget || !playerReady || !connected || !currentTrack() || playerUnavailable) return;
   if (syncing) { pendingForce ||= force; return; }
   const instance = widget, generation = loadGeneration, attempt = ++syncAttempt, serial = intentSerial;
   let active = true;
   syncing = true;
-  const valid = () => active && connected && !isHeld() && generation === loadGeneration && instance === widget && attempt === syncAttempt && serial === intentSerial;
+  const valid = () => active && connected && generation === loadGeneration && instance === widget && attempt === syncAttempt && serial === intentSerial;
   const finish = () => {
     if (!valid()) return;
     active = false;
@@ -752,9 +844,9 @@ function reconcile(force = false) {
         lastCorrection = performance.now();
       }
       const playing = playbackState().playing;
-      if (playing && audioEnabled && paused) commandPlayback(true);
+      if (playing && paused && !needsAudioClick) commandPlayback(true);
       else if (!playing && !paused) commandPlayback(false);
-      if (!audioEnabled) setSync('Tap “Enable listening” to hear the room', true);
+      if (playing && needsAudioClick) setSync('Your browser needs a click to start audio', true);
       else if (playing && paused) setSync('Starting playback');
       else setSync(playing ? 'Listening together' : 'Paused');
       finish();
@@ -777,7 +869,7 @@ setInterval(() => reconcile(), 2500);
 // Server time remains authoritative. Host reports are deliberately infrequent and
 // only correct real buffering stalls, rather than moving the room every frame.
 heartbeatTimer = setInterval(() => {
-  if (!isHost() || !connected || !playerReady || !audioEnabled || waitingLocally || syncing || pendingIntent || playerUnavailable || !room.playback.playing || !lastWidgetPlaying) return;
+  if (!isHost() || !connected || !playerReady || !audioEnabled || syncing || pendingIntent || playerUnavailable || !room.playback.playing || !lastWidgetPlaying) return;
   const instance = widget, trackId = loadedTrackId, baseRevision = room.revision;
   instance.getPosition((position) => {
     if (instance !== widget || trackId !== room?.currentTrackId || baseRevision !== room?.revision) return;
@@ -787,6 +879,10 @@ heartbeatTimer = setInterval(() => {
     }
   });
 }, 5000);
+setInterval(() => {
+  if (!connected || !playerReady || !room?.playback.playing || performance.now() - lastProgressAt > 15000) return;
+  send({ type: 'listening', trackId: room.currentTrackId, generation: playbackGeneration(), positionMs: lastProgressPosition });
+}, 10000);
 
 $('create-form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -798,7 +894,6 @@ $('create-form').addEventListener('submit', async (event) => {
     const response = await fetch('/api/rooms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     const result = await response.json();
     if (!response.ok) throw new Error(result.message || result.error || 'Couldn’t create the room. Try again.');
-    audioEnabled = false;
     openRoom(result.roomId, $('create-name').value);
   } catch (error) { errorAt('create-error', error.message); }
   finally { button.disabled = false; }
@@ -815,7 +910,6 @@ $('join-form').addEventListener('submit', async (event) => {
   try {
     const response = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`);
     if (!response.ok) throw new Error('This room has ended or doesn’t exist. Start a new one from the home page.');
-    audioEnabled = false;
     openRoom(roomId, $('join-name').value);
   } catch (error) { errorAt('join-error', error.message); }
 });
@@ -836,11 +930,9 @@ $('invite-button').addEventListener('click', async () => {
   catch { window.prompt('Copy this room link:', invite); }
 });
 $('play-button').addEventListener('click', () => {
-  if (!currentTrack() || !playerReady || !connected || playerUnavailable || waitingLocally) return;
-  audioEnabled = true;
+  if (!currentTrack() || !playerReady || !connected || playerUnavailable) return;
   $('enable-audio').hidden = true;
   const playing = playbackState().playing;
-  if (!playing && !isHost()) return;
   hostIntent(playing ? 'pause' : 'play', playing ? lastPosition : targetPosition());
 });
 $('skip-button').addEventListener('click', () => {
@@ -871,11 +963,9 @@ $('seek').addEventListener('change', () => {
 });
 $('enable-audio').addEventListener('click', () => {
   if (!playerReady || !widget || !connected || playerUnavailable) return;
-  audioEnabled = true;
   $('enable-audio').hidden = true;
   if (playbackState().playing) { commandSeek(targetPosition()); commandPlayback(true); }
-  else if (isHost()) hostIntent('play', targetPosition());
-  else toast('You’re ready. Playback starts when the host presses play.');
+  else hostIntent('play', targetPosition());
   reconcile(true);
 });
 $('resync-button').addEventListener('click', () => {
@@ -895,50 +985,6 @@ $('mute-button').addEventListener('click', () => {
   applyVolume();
 });
 $('theme-toggle').addEventListener('click', () => applyTheme(storage.get('theme') === 'dark' ? 'light' : 'dark'));
-$('wait-button').addEventListener('click', () => {
-  if (!connected || !currentTrack()) return;
-  if (!waitingLocally && pauseCoolingDown()) { toast('Pause is cooling down. Try again shortly.'); return; }
-  if (waitingLocally) {
-    waitingLocally = false;
-    localAdPlaying = false;
-    nativeCheck = null;
-    clearIntent();
-    commandPlayback(false);
-    send({ type: 'hold_ready' });
-    reconcile(true);
-  } else {
-    waitingLocally = true;
-    localAdPlaying = false;
-    nativeCheck = null;
-    clearIntent();
-    pendingHold = { trackId: room.currentTrackId, playing: false, positionMs: lastPosition, updatedAt: serverNow() };
-    commandPlayback(false);
-    if (!send({ type: 'hold' })) { pendingHold = null; waitingLocally = false; }
-    else {
-      const request = pendingHold;
-      setTimeout(() => {
-        if (pendingHold !== request) return;
-        pendingHold = null;
-        waitingLocally = false;
-        localAdPlaying = false;
-        renderControls();
-        reconcile(true);
-        toast('The pause request was not confirmed. Try again.');
-      }, 5000);
-    }
-    setSync('Pausing the room', true);
-  }
-  renderControls();
-});
-$('local-ad-button').addEventListener('click', () => {
-  if (!waitingLocally || !isHeld() || !connected || !playerReady || playerUnavailable) return;
-  nativeCheck = null;
-  invalidateReconcile();
-  localAdPlaying = !localAdPlaying;
-  audioEnabled = true;
-  commandPlayback(localAdPlaying);
-  renderControls();
-});
 $('import-playlist-button').addEventListener('click', () => {
   if (!playlistTracks.length) return;
   if (send({ type: 'add_many', tracks: playlistTracks })) { closePlaylist(); toast('Playlist sent to the queue.'); }
@@ -955,9 +1001,6 @@ function leaveRoom() {
   socket = null;
   previous?.close();
   connected = false;
-  waitingLocally = false;
-  pendingHold = null;
-  localAdPlaying = false;
   window.SCJamsQueue?.clear();
   closePlaylist();
   clearPlayer();
@@ -970,10 +1013,41 @@ function leaveRoom() {
   $('room-view').hidden = true;
   $('join-overlay').hidden = true;
   $('landing').hidden = false;
+  $('room-closed-view').hidden = true;
   document.title = 'sc jams';
+}
+function closeRoom(message) {
+  stopped = true;
+  connected = false;
+  clearTimeout(reconnectTimer);
+  clearInterval(pingTimer);
+  clearTimeout(pauseCooldownTimer);
+  clearTimeout(autoplayProbeTimer);
+  clearTimeout(toastTimer);
+  const previous = socket;
+  socket = null;
+  previous?.close();
+  window.SCJamsQueue?.clear();
+  $('queue').replaceChildren();
+  $('people').replaceChildren();
+  $('people-count').textContent = '0';
+  closePlaylist();
+  clearPlayer();
+  room = null;
+  roomId = null;
+  lastRevision = -1;
+  joinedOnce = false;
+  $('landing').hidden = true;
+  $('join-overlay').hidden = true;
+  $('room-view').hidden = true;
+  $('room-closed-message').textContent = message;
+  $('room-closed-view').hidden = false;
+  $('toast').hidden = true;
+  document.title = 'Room closed · sc jams';
 }
 $('leave-room').addEventListener('click', leaveRoom);
 $('join-back').addEventListener('click', leaveRoom);
+$('new-room-button').addEventListener('click', leaveRoom);
 applyVolume();
 applyTheme(storage.get('theme') || (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { send({ type: 'ping', sentAt: Date.now() }); reconcile(true); } });

@@ -19,9 +19,8 @@ export function createJamServer({
   port = Number(process.env.PORT || 3000),
   host = process.env.HOST || '127.0.0.1',
   now = Date.now,
-  hostGraceMs = 15_000,
-  roomIdleMs = 2 * 60 * 60 * 1000,
-  memberGraceMs = 120_000,
+  roomIdleMs = 30 * 60 * 1000,
+  cleanupIntervalMs = 30_000,
   maxRooms = 1000,
   random = Math.random,
   publicOrigin = process.env.PUBLIC_ORIGIN,
@@ -37,7 +36,12 @@ export function createJamServer({
     socket.send(JSON.stringify(message));
   }
 
-  const store = createRoomStore({ now, hostGraceMs, roomIdleMs, memberGraceMs, maxRooms, random, onChange: (room) => {
+  const store = createRoomStore({ now, roomIdleMs, maxRooms, random, onClose: (room) => {
+    for (const member of room.members.values()) {
+      send(member.socket, { type: 'room_closed', reason: 'inactive', message: 'This room closed after 30 minutes without playback.' });
+      member.socket.close(4004, 'Room inactive');
+    }
+  }, onChange: (room) => {
     const message = { type: 'state', serverTime: now(), room: store.snapshot(room) };
     for (const member of room.members.values()) if (member.connected) send(member.socket, message);
   } });
@@ -170,7 +174,7 @@ export function createJamServer({
     }
     store.cleanup();
     for (const [key, limit] of creationLimits) if (now() - limit.since > 60_000) creationLimits.delete(key);
-  }, 30_000);
+  }, cleanupIntervalMs);
   heartbeat.unref();
 
   return {

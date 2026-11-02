@@ -39,6 +39,10 @@
         <p id="join-error" class="inline-error" role="alert" hidden></p>
         <button id="join-back" class="text-button join-toggle" type="button"><svg data-icon="arrow-left" aria-hidden="true"></svg><span>Create a different room</span></button>
       </section>
+      <section id="room-closed-view" class="landing closed-section" aria-labelledby="room-closed-title" hidden>
+        <div class="entry-heading"><h1 id="room-closed-title">This room has closed.</h1><p id="room-closed-message" role="status">Rooms close after 30 minutes without playback.</p></div>
+        <button id="new-room-button" class="button primary" type="button"><svg data-icon="arrow-left" aria-hidden="true"></svg><span>Back to start</span></button>
+      </section>
       <section id="room-view" class="room-view" aria-label="Listening room" hidden>
         <div class="room-heading">
           <div class="room-identity"><div class="room-title-row"><h1>Your room</h1><span id="connection" class="connection"><i></i>Connecting</span></div><p id="room-subtitle" class="room-code"></p></div>
@@ -60,7 +64,7 @@
           </div>
           <div class="player-caption"><span id="sync-indicator" class="sync-indicator"><i></i>Ready</span><span id="role-hint" class="role-hint">The host controls playback.</span></div>
         </section>
-        <div class="room-meta"><section class="listeners" aria-label="Listeners"><span class="listeners-label"><svg data-icon="users" aria-hidden="true"></svg><span id="people-count">0</span></span><ul id="people" class="people"></ul></section><div class="listening-actions"><button id="wait-button" class="text-button" type="button" title="Pause everyone's music while you catch up" disabled>Wait for me</button><button id="local-ad-button" class="text-button" type="button" aria-pressed="false" hidden>Let my ad finish</button><button id="resync-button" class="text-button" type="button" hidden><svg data-icon="rotate-cw" aria-hidden="true"></svg><span>Resync</span></button></div></div>
+        <div class="room-meta"><section class="listeners" aria-label="Listeners"><span class="listeners-label"><svg data-icon="users" aria-hidden="true"></svg><span id="people-count">0</span></span><ul id="people" class="people"></ul></section><div class="listening-actions"><button id="resync-button" class="text-button" type="button" hidden><svg data-icon="rotate-cw" aria-hidden="true"></svg><span>Resync</span></button></div></div>
         <section class="queue-section panel" aria-labelledby="queue-title">
           <div class="section-heading"><h2 id="queue-title">Queue <span id="queue-count">0</span></h2><div class="queue-tools" aria-label="Queue settings"><button id="repeat-button" class="icon-button queue-tool" type="button" aria-label="Loop off. Repeat current track" aria-pressed="false" title="Loop off" hidden><svg data-icon="repeat" aria-hidden="true"></svg></button><button id="shuffle-button" class="icon-button queue-tool" type="button" aria-label="Shuffle upcoming tracks" title="Shuffle upcoming tracks" hidden><svg data-icon="shuffle" aria-hidden="true"></svg></button></div></div>
           <form id="add-form"><label class="sr-only" for="track-url">SoundCloud track or playlist link</label><div class="add-input-wrap"><span class="input-icon" aria-hidden="true"><svg data-icon="link"></svg></span><input id="track-url" type="url" required placeholder="Paste a SoundCloud track or playlist link" autocomplete="off"><button id="add-button" class="button secondary" type="submit"><svg data-icon="plus" aria-hidden="true"></svg><span>Add</span></button></div></form>
@@ -71,7 +75,7 @@
       </section>
     </main>
     <footer class="app-footer">
-      <details id="help-details"><summary>How it works</summary><div class="help-content"><p>Anyone can add music or pause. The host resumes playback. In a two-person room, either listener can skip; larger rooms use a majority vote when a guest asks to skip.</p><p>The host can loop the current track, repeat the queue, or shuffle upcoming music. A single remaining track repeats until another is added.</p><p>“Wait for me” pauses everyone's music. Choose “I'm ready” when you're set; the host resumes after everyone is ready. “Let my ad finish” plays only your audio while the room waits.</p><p>Volume is just for you. sc jams is independent of SoundCloud; playback and availability are provided by SoundCloud.</p></div></details>
+      <details id="help-details"><summary>How it works</summary><div class="help-content"><p>Anyone can add music, play, or pause. Repeated play/pause requests have a short cooldown in shared rooms; a host alone is exempt. Two-person rooms allow direct skipping; larger rooms use a majority vote for guest skips.</p><p>Added tracks start playback. Skips, loops, and queue transitions continue automatically. If your browser asks, choose “Enable listening” once to allow audio.</p><p>The host can loop tracks or the queue, shuffle upcoming music, and manage the order. If the host disconnects, the longest-standing listener takes over immediately. Rooms close after 30 minutes without music activity.</p><p>Volume is just for you. sc jams is independent of SoundCloud; playback and availability are provided by SoundCloud.</p></div></details>
       <nav class="footer-links" aria-label="Project links"><a href="https://github.com/bwaeden/sc-jams" target="_blank" rel="noopener noreferrer" class="footer-link" title="View sc jams on GitHub"><svg data-icon="github" aria-hidden="true"></svg><span>GitHub</span></a><a href="/support.html" target="_blank" rel="noopener noreferrer" class="footer-link coffee-link"><svg data-icon="coffee" aria-hidden="true"></svg><span>Buy me a coffee</span></a></nav>
     </footer>
   </div>

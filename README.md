@@ -4,7 +4,7 @@ Minimal, desktop-first listening rooms for SoundCloud. Create a room, copy the i
 
 [Source on GitHub](https://github.com/bwaeden/sc-jams)
 
-Everyone can add music and pause shared playback. The host resumes, seeks, and manages the queue. Each listener streams through SoundCloud's official embedded player; the server exchanges room state over WebSockets and never downloads, stores, or relays audio.
+Everyone can add music, play, and pause shared playback. The host seeks and manages the queue. Each listener streams through SoundCloud's official embedded player; the server exchanges room state over WebSockets and never downloads, stores, or relays audio.
 
 This is an experimental prototype. Real browser playback and audible synchronization are still unverified; there is no measured latency guarantee.
 
@@ -34,7 +34,7 @@ Use full URLs such as `https://soundcloud.com/artist/track` or `https://soundclo
 
 Playlist import uses the Widget API's `getSounds` result and adds individual public tracks. Duplicate tracks are omitted, and the shared queue holds at most 100 tracks. The preview may expose only part of a large playlist; restricted or unavailable tracks can still fail during playback.
 
-After playback starts, finishing a track automatically starts the next queued track. With repeat off, finished or skipped tracks leave the queue instead of accumulating as history. Their rows slide upward and collapse briefly; reduced-motion preferences disable the animation. A single remaining track repeats until another is queued, then advances on its next completion.
+Adding music starts playback, including resuming an existing paused track when adding to a populated queue. Finishing, skipping, selecting, or looping a track starts the next playback automatically. With repeat off, completed tracks leave the queue instead of accumulating as history. Their rows slide upward and collapse briefly; reduced-motion preferences disable the animation. A single remaining track repeats until another is queued, then advances on its next completion.
 
 The host can drag upcoming tracks by their handles or use the move-up/move-down buttons. The current track remains first, and reordering does not change playback position. Selecting another track plays it in place of the current one while preserving the other upcoming tracks. With queue repeat enabled, the previous track moves to the back; otherwise it leaves the queue.
 
@@ -42,9 +42,9 @@ The queue shows who added every track, including the current one. The name is ca
 
 ## Shared controls and queue modes
 
-In a two-person room, either listener can skip directly. With three or more connected listeners, a guest's skip request casts their vote and opens a compact voting control next to Skip on everyone's screen. Passing requires a strict majority of connected listeners: 2 of 3, 3 of 4, and so on. Each listener gets one vote; disconnected voters are removed and the threshold follows the connected room size. Passing advances immediately and starts the next track unless the room is explicitly waiting. The host can still skip directly or join a vote.
+In a two-person room, either listener can skip directly. With three or more connected listeners, a guest's skip request casts their vote and opens a compact voting control next to Skip on everyone's screen. Passing requires a strict majority of connected listeners: 2 of 3, 3 of 4, and so on. Each listener gets one vote; disconnected voters are removed and the threshold follows the connected room size. Passing advances immediately and starts the next track, even if the previous track was paused. The host can still skip directly or join a vote.
 
-Anyone can pause, while resuming remains the host's action. In shared rooms, four pause/wait requests within ten seconds trigger a ten-second cooldown on the next request. The limit is per listener, persists through reconnects, and does not apply to a host alone in their room. Volume and other controls remain available during the cooldown.
+Anyone can pause or resume. In shared rooms, four play/pause requests within ten seconds trigger a ten-second cooldown on the next request. The limit is per listener, persists through reconnects, and does not apply to a host alone in their room. Automatic playback transitions do not count as user toggle requests. Volume and other controls remain available during the cooldown.
 
 Only the host sees loop and shuffle controls. Loop cycles through **Off**, **Current track**, and **Queue**. Track repeat restarts the same song; queue repeat rotates completed songs to the back. Manual skips bypass track repeat. Shuffle changes only upcoming tracks, leaves the playing track and its position intact, and is available when there are at least two upcoming tracks. Duplicate completion events cannot advance a repeated song twice.
 
@@ -56,19 +56,17 @@ The support page reads its donation destination from `public/support.json`. Its 
 
 The layout follows the restrained hierarchy of [Linear's interface refresh](https://linear.app/now/behind-the-latest-design-refresh) and the focused controls of [Apple Music MiniPlayer](https://support.apple.com/guide/music-web-review/use-music-miniplayer-apdm333a63ec/web). Icons use a consistent local SVG set based on [Lucide's design principles](https://lucide.dev/contribute/icons/design-principles); no icon fonts, external icon scripts, or text characters are used for transport controls. Lucide and Feather notices are included in `public/icons.LICENSE.txt`.
 
-Shared playback controls are enabled after SoundCloud reports that the player is ready. Host playback actions and guest pauses from either the site's controls or the SoundCloud embed use the same synchronization flow. A local action takes effect immediately and remains pending until the server confirms it; older asynchronous position callbacks cannot undo a newer pause or seek. Guest volume remains personal. Guests cannot resume a room that is paused.
+Shared playback controls are enabled after SoundCloud reports that the player is ready. Every listener's play/pause actions from either the site's controls or the SoundCloud embed use the same synchronization flow. A local action takes effect immediately and remains pending until the server confirms it; older asynchronous position callbacks cannot undo a newer action. Volume remains personal.
 
-If the host disconnects, their role is reserved for 15 seconds before passing to a connected listener. Invite links have no password: anyone with the link can join and add music.
+Disconnected users leave the listener list immediately. If the host leaves, hosting passes immediately to the connected listener who joined earliest. A returning former host rejoins at the end of that order. Invite links have no password: anyone with the link can join and add music.
 
-## Ads and waiting
+## Autoplay and inactive rooms
 
-Ads are independent for each listener. sc jams cannot detect ad start/end through the documented Widget API, make everyone receive the same ad, or guarantee that connecting a paid account would change embedded-player advertising.
+The player attempts audio whenever the room starts or advances music, rather than relying on a previous local play flag. Browsers can still require a listener's first click before permitting audio. In that case the site shows **Enable listening**; it does not report blocked audio as successfully playing. SoundCloud controls availability and any advertising in its player.
 
-Choose **Wait for me** to pause everyone's music immediately, including your own. Choose **I'm ready** afterward. The host can resume once every waiting listener is ready. Several listeners can wait independently, and a disconnected listener cannot leave the room blocked indefinitely.
+Rooms close after 30 minutes without music activity. Paused or empty rooms expire even if a browser stays connected; pings, metadata, and queue reordering do not extend the timeout. Actual advancing player progress keeps an active room alive. A room with no listeners, or one whose browsers never started audio, cannot remain alive indefinitely just because its server playback flag is set.
 
-If you need an ad to finish, choose **Let my ad finish** while waiting. This explicitly plays only your local audio while everyone else stays paused; it never resumes shared playback. Choosing **I'm ready** pauses local audio again until the host resumes. Waiting no longer assumes that the requester is hearing an ad.
-
-This is a manual fallback, not automatic ad synchronization. SoundCloud's [advertising information](https://community.soundcloud.com/company/advertise) lists embedded players as an audio-ad channel, but this does not establish that every embedded session will receive ads. Buffering, ads, browser restrictions, and track availability can still interrupt alignment. sc jams does not skip or remove SoundCloud advertising.
+When a room expires, connected browsers stop playback, show a closed-room notice, and can return to the start screen. They do not repeatedly reconnect to the expired room.
 
 ## Hosting
 
@@ -116,7 +114,7 @@ npm test
 
 Tests use real HTTP/WebSocket clients for room behavior and a simulated SoundCloud widget for delayed playback callbacks. They do not establish audible synchronization or replace real browser testing. Docker execution has not been verified in this environment.
 
-For manual checks, join the same room from two desktop browser profiles and try volume, mute, themes, playlist import, play/pause/seek, late joining, waiting, and reconnection. Check free and paid listeners separately when validating ad behavior.
+For manual checks, join the same room from two desktop browser profiles and try volume, mute, themes, playlist import, shared play/pause, skip voting, loops, late joining, host departure, and reconnection. Check the first audio interaction separately from subsequent automatic transitions.
 
 The source is small: `src/server.js` handles HTTP and WebSockets, `src/rooms.js` holds room behavior, `public/` contains the one-page interface, and `test/` covers protocol and client logic. Contributions should preserve the short primary flow. Report playback issues with browser/OS details and reproduction steps; do not post private invite links or reconnect credentials.
 

@@ -9,7 +9,7 @@ const EVENTS = Object.fromEntries(['READY', 'PLAY_PROGRESS', 'PLAY', 'PAUSE', 'S
 
 // This deliberately leaves widget getters pending. SoundCloud's iframe API is
 // asynchronous, so track changes and server updates can arrive before a getter.
-function browser({ saved = {}, asyncEvents = false, responses = {} } = {}) {
+function browser({ saved = {}, asyncEvents = false, responses = {}, blockPlay = false } = {}) {
   let timestamp = 1_800_000_000_000, monotonic = 10_000, timerId = 0;
   const intervals = [], timeouts = new Map(), elements = new Map(), widgets = [], sockets = [], messages = [], widgetEvents = [], requests = [], clipboard = [];
   class Element {
@@ -42,6 +42,9 @@ function browser({ saved = {}, asyncEvents = false, responses = {} } = {}) {
     const instance = {
       iframe, callbacks, pendingPositions: [], pendingPaused: [], pendingSounds: [], calls: [], paused: true, volume: 100, deferPaused: false,
       bind(event, callback) { callbacks.set(event, callback); },
+      unbind(event) { callbacks.delete(event); },
+      blockPlay,
+      load(url, options) { this.calls.push({ method: 'load', url }); this.url = url; this.paused = true; callbacks.set(EVENTS.READY, options.callback); },
       emit(event, payload = {}) { callbacks.get(event)?.(payload); },
       getPosition(callback) { this.pendingPositions.push(callback); },
       resolvePosition(position) {
@@ -62,7 +65,7 @@ function browser({ saved = {}, asyncEvents = false, responses = {} } = {}) {
       setVolume(value) { this.volume = value; this.calls.push({ method: 'setVolume', volume: value }); },
       dispatch(event, payload = {}) { if (asyncEvents) widgetEvents.push(() => this.emit(event, payload)); else this.emit(event, payload); },
       seekTo(position) { this.calls.push({ method: 'seekTo', position }); this.dispatch(EVENTS.SEEK, { currentPosition: position }); },
-      play() { this.calls.push({ method: 'play' }); this.paused = false; this.dispatch(EVENTS.PLAY); },
+      play() { this.calls.push({ method: 'play' }); if (this.blockPlay) return; this.paused = false; this.dispatch(EVENTS.PLAY); },
       pause() { this.calls.push({ method: 'pause' }); this.paused = true; this.dispatch(EVENTS.PAUSE); },
     };
     widgets.push(instance);
@@ -114,7 +117,7 @@ function browser({ saved = {}, asyncEvents = false, responses = {} } = {}) {
         if ('clockOffset' in next) clockOffset = next.clockOffset;
         if ('socket' in next) socket = next.socket;
       },
-      status() { return { syncing, loadedTrackId, loadGeneration, playerReady, pendingIntent, volume, waitingLocally, playlistTracks }; }
+      status() { return { syncing, loadedTrackId, loadGeneration, playerReady, pendingIntent, volume, playlistTracks, needsAudioClick, stopped, connected }; }
     };
   `, context, { filename: 'app.js' });
   const app = context.__appTest;
@@ -136,6 +139,7 @@ function browser({ saved = {}, asyncEvents = false, responses = {} } = {}) {
       assert.ok(interval, `expected a ${ms}ms interval`);
       interval.callback();
     },
+    hasTimeout(ms) { return [...timeouts.values()].some((timer) => timer.ms === ms); },
     timeout(ms) {
       const entry = [...timeouts].find(([, timer]) => timer.ms === ms);
       assert.ok(entry, `expected a pending ${ms}ms timeout`);
@@ -178,12 +182,6 @@ function resolvePositions(widget, position = 10000) {
   }
 }
 
-function heldRoom(browser, { host = false, requester = browser.app.clientId, ready = false, revision = 2 } = {}) {
-  const state = room(browser, { host, playing: false, position: 10000, revision });
-  state.hold = { memberId: requester, name: 'User', wasPlaying: true, waiters: [{ memberId: requester, name: 'User', ready }] };
-  return state;
-}
-
 function receive(browser, state) {
   browser.sockets[0].emit('message', { data: JSON.stringify({ type: 'state', serverTime: browser.now(), room: state }) });
 }
@@ -221,7 +219,8 @@ test('switching tracks during a pending getter cannot freeze the next player', (
   assert.equal(b.app.status().syncing, true);
   const nextState = room(b, { id: 'track-b', position: 60000, revision: 2 });
   const nextWidget = load(b, nextState);
-  assert.equal(nextWidget.pendingPositions.length, 1, 'the new player must reconcile despite the previous getter');
+  assert.equal(nextWidget, oldWidget, 'track changes preserve the audio iframe');
+  assert.equal(nextWidget.pendingPositions.length, 2, 'the new load reconciles even while the old getter is pending');
   oldWidget.resolvePosition(5);
   assert.equal(oldWidget.calls.filter((call) => call.method === 'seekTo').length, 0);
   nextWidget.resolvePosition(0);
@@ -426,105 +425,6 @@ test('canceling a playlist ignores its late metadata callback and cannot import 
   assert.equal(b.element('playlist-import').hidden, true);
 });
 
-test('Wait for me pauses the requester immediately and stale getters cannot restart it before acknowledgment', () => {
-  const b = browser({ asyncEvents: true });
-  b.app.connect();
-  const widget = load(b, room(b, { host: true }));
-  widget.paused = false;
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  widget.calls.length = 0;
-  b.messages.length = 0;
-  b.app.reconcile(); // This asynchronous getter belongs to the old playing state.
-  assert.equal(widget.pendingPositions.length, 1);
-  b.event('wait-button', 'click');
-  assert.equal(b.app.status().waitingLocally, true);
-  assert.equal(b.messages.at(-1).type, 'hold');
-  assert.equal(widget.paused, true, 'Wait must pause local music before the server responds');
-  widget.resolvePosition(10000);
-  b.advance(2500);
-  b.interval(2500);
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  assert.equal(widget.paused, true, 'optimistic waiting must survive periodic sync before hold acknowledgment');
-  assert.equal(widget.calls.filter((call) => call.method === 'play').length, 0);
-  assert.equal(b.messages.filter((message) => message.type === 'control' && message.action === 'play').length, 0);
-});
-
-test('a hold from another listener pauses audio before outstanding widget getters return', () => {
-  const b = browser({ asyncEvents: true });
-  b.app.connect();
-  const widget = load(b, room(b));
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  widget.calls.length = 0;
-  b.app.reconcile();
-  assert.equal(widget.pendingPositions.length, 1);
-  receive(b, heldRoom(b, { requester: 'a-friend' }));
-  assert.equal(widget.paused, true);
-  assert.ok(widget.calls.some((call) => call.method === 'pause'));
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  assert.equal(widget.paused, true);
-  assert.equal(widget.calls.filter((call) => call.method === 'play').length, 0);
-});
-
-test('ad playback is local and explicit; readiness pauses it until the host resumes', () => {
-  const b = browser({ asyncEvents: true });
-  b.app.connect();
-  const widget = load(b, room(b));
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  b.messages.length = 0;
-  b.event('wait-button', 'click');
-  receive(b, heldRoom(b));
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  assert.equal(widget.paused, true);
-  assert.equal(b.element('local-ad-button').hidden, false);
-  b.event('local-ad-button', 'click');
-  assert.equal(widget.paused, false, 'only the explicit local ad action can play during the wait');
-  widget.calls.length = 0;
-  b.interval(2500);
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  assert.equal(widget.calls.filter((call) => call.method === 'pause' || call.method === 'seekTo').length, 0);
-  b.event('wait-button', 'click');
-  assert.equal(b.messages.at(-1).type, 'hold_ready');
-  assert.equal(widget.paused, true, 'marking ready must stop local ad playback');
-  receive(b, heldRoom(b, { ready: true, revision: 3 }));
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  assert.equal(widget.paused, true, 'personal readiness cannot start the shared track');
-  const resumed = room(b, { playing: true, position: 10000, revision: 3 });
-  resumed.hold = null;
-  resumed.revision = 4;
-  receive(b, resumed);
-  resolvePositions(widget);
-  b.flushWidgetEvents();
-  assert.equal(widget.paused, false, 'host resume starts the ready listener');
-  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
-});
-
-test('the host cannot resume from site controls while a listener is not ready', () => {
-  const b = browser();
-  b.app.connect();
-  const widget = load(b, room(b, { host: true }));
-  resolvePositions(widget);
-  receive(b, heldRoom(b, { host: true, requester: 'a-friend' }));
-  resolvePositions(widget);
-  assert.equal(widget.paused, true);
-  assert.equal(b.element('play-button').disabled, true);
-  b.messages.length = 0;
-  b.event('play-button', 'click');
-  assert.equal(b.messages.filter((message) => message.action === 'play').length, 0);
-  receive(b, heldRoom(b, { host: true, requester: 'a-friend', ready: true, revision: 3 }));
-  resolvePositions(widget);
-  assert.equal(b.element('play-button').disabled, false);
-  b.event('play-button', 'click');
-  assert.equal(b.messages.filter((message) => message.action === 'play').length, 1);
-});
-
 test('natural finish advances once and the next track starts at READY without waiting for a getter', () => {
   const b = browser({ asyncEvents: true });
   b.app.connect();
@@ -538,6 +438,7 @@ test('natural finish advances once and the next track starts at READY without wa
   widget.emit(EVENTS.FINISH);
   widget.paused = true;
   widget.emit(EVENTS.PAUSE, { currentPosition: 240000 });
+  widget.resolvePosition(240000);
   const finishes = b.messages.filter((message) => message.action === 'finish');
   assert.equal(finishes.length, 1);
   assert.equal(finishes[0].trackId, 'track-a');
@@ -545,12 +446,14 @@ test('natural finish advances once and the next track starts at READY without wa
   const next = room(b, { host: true, id: 'track-b', playing: true, position: 0, revision: 2 });
   receive(b, next);
   const nextWidget = b.widgets.at(-1);
-  assert.notEqual(nextWidget, widget);
+  assert.equal(nextWidget, widget, 'queued songs reuse the granted media element');
   nextWidget.emit(EVENTS.READY);
   assert.equal(nextWidget.paused, false, 'the next track starts before its delayed position getter resolves');
   assert.ok(nextWidget.calls.some((call) => call.method === 'play'));
   assert.equal(nextWidget.pendingPositions.length, 1);
+  resolvePositions(nextWidget, 0);
   widget.emit(EVENTS.FINISH);
+  widget.resolvePosition(0);
   assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
 });
 
@@ -561,6 +464,7 @@ test('an empty authoritative queue clears the player and does not restart remove
   resolvePositions(widget);
   b.messages.length = 0;
   widget.emit(EVENTS.FINISH);
+  widget.resolvePosition(240000);
   const ended = room(b, { host: true, playing: false, position: 0, revision: 2 });
   ended.queue = [];
   ended.currentTrackId = null;
@@ -581,11 +485,13 @@ test('an end-of-track PAUSE followed by FINISH advances without pausing the next
   const widget = load(b, initial);
   resolvePositions(widget, 239900);
   b.flushWidgetEvents();
+  b.advance(2000);
   b.messages.length = 0;
   widget.paused = true;
   widget.emit(EVENTS.PAUSE, { currentPosition: 240000 });
   assert.equal(b.messages.filter((message) => message.action === 'pause').length, 0);
   widget.emit(EVENTS.FINISH);
+  widget.resolvePosition(240000);
   assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
   receive(b, room(b, { host: true, id: 'track-b', playing: true, position: 0, revision: 2 }));
   const next = b.widgets.at(-1);
@@ -598,6 +504,7 @@ test('a deliberate native pause near the end still pauses when no FINISH follows
   const b = browser();
   const widget = load(b, room(b, { host: true, position: 239900 }));
   resolvePositions(widget, 239900);
+  b.advance(2000);
   b.messages.length = 0;
   widget.paused = true;
   widget.emit(EVENTS.PAUSE, { currentPosition: 239950 });
@@ -608,8 +515,8 @@ test('a deliberate native pause near the end still pauses when no FINISH follows
   assert.equal(b.app.status().pendingIntent.playing, false);
 });
 
-test('a late finish event cannot advance a host who just paused or asked the room to wait', () => {
-  for (const action of ['play-button', 'wait-button']) {
+test('a late finish event cannot advance a listener who just paused', () => {
+  for (const action of ['play-button']) {
     const b = browser({ asyncEvents: true });
     const widget = load(b, room(b, { host: true }));
     resolvePositions(widget);
@@ -640,18 +547,6 @@ test('a previously generated Listener name is no longer shown as a chosen nickna
   const b = browser({ saved: { 'sc-jams:name': 'Listener 52e5' } });
   assert.equal(b.element('create-name').value, '');
   assert.equal(b.element('join-name').value, '');
-});
-
-test('a rejected wait request restores the room controls instead of leaving them stuck', () => {
-  const b = browser();
-  b.app.connect();
-  const widget = load(b, room(b, { host: true }));
-  widget.resolvePosition(10000);
-  b.event('wait-button', 'click');
-  assert.equal(b.element('play-button').disabled, true);
-  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'rejected_hold', message: 'Try again.' }) });
-  assert.equal(b.element('play-button').disabled, false);
-  assert.equal(b.element('wait-button').disabled, false);
 });
 
 test('site pause stops the widget immediately and invalidates an older sync getter', () => {
@@ -853,10 +748,10 @@ test('a guest can pause and the authoritative server position acknowledgment can
   b.flushWidgetEvents();
   assert.equal(b.app.status().pendingIntent, null);
   assert.equal(widget.paused, true);
-  assert.equal(b.element('play-button').disabled, true);
-  assert.equal(b.element('play-button')['aria-label'], 'Waiting for host to resume');
+  assert.equal(b.element('play-button').disabled, false);
+  assert.equal(b.element('play-button')['aria-label'], 'Play shared track');
   b.event('play-button', 'click');
-  assert.equal(b.messages.filter((message) => message.action === 'play').length, 0);
+  assert.equal(b.messages.filter((message) => message.action === 'play').length, 1);
 });
 
 test('native guest pause publishes, while natural completion cannot pause the next track', () => {
@@ -983,19 +878,278 @@ test('same-track generations restart a looping song and reject old completion ca
   b.messages.length = 0;
   first.emit(EVENTS.FINISH);
   first.emit(EVENTS.FINISH);
+  first.resolvePosition(240000);
   assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
   assert.equal(b.messages.find((message) => message.action === 'finish').generation, 10);
   receive(b, lobby(b, { host: true, position: 0, revision: 2, generation: 11 }));
   const restarted = b.widgets.at(-1);
-  assert.notEqual(restarted, first);
-  restarted.emit(EVENTS.READY);
+  assert.equal(restarted, first, 'looping retains the same media element');
+  assert.ok(restarted.calls.some((call) => call.method === 'seekTo' && call.position === 0));
   assert.equal(restarted.paused, false);
-  first.emit(EVENTS.FINISH);
-  assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
   resolvePositions(restarted, 0);
+  first.emit(EVENTS.FINISH);
+  first.resolvePosition(0);
+  assert.equal(b.messages.filter((message) => message.action === 'finish').length, 1);
   b.flushWidgetEvents();
   restarted.emit(EVENTS.FINISH);
   restarted.emit(EVENTS.FINISH);
+  restarted.resolvePosition(240000);
   assert.equal(b.messages.filter((message) => message.action === 'finish').length, 2);
   assert.equal(b.messages.filter((message) => message.action === 'finish').at(-1).generation, 11);
+});
+
+test('autoplay is attempted without a prior audio opt-in and a blocked browser gets a truthful click fallback', () => {
+  const b = browser({ blockPlay: true });
+  b.app.configure({ audioEnabled: false });
+  const widget = load(b, room(b));
+  assert.match(widget.iframe.src, /auto_play=true/);
+  assert.ok(widget.calls.some((call) => call.method === 'play'), 'READY immediately attempts playback before asynchronous getters');
+  assert.equal(b.element('playback-label').textContent, 'Starting');
+  b.timeout(700);
+  assert.equal(b.app.status().needsAudioClick, true);
+  assert.equal(b.element('enable-audio').hidden, false);
+  assert.equal(b.element('playback-label').textContent, 'Click to listen');
+  widget.blockPlay = false;
+  b.messages.length = 0;
+  b.event('enable-audio', 'click');
+  assert.equal(widget.paused, false);
+  assert.equal(b.element('enable-audio').hidden, true);
+  assert.equal(b.element('playback-label').textContent, 'Playing');
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0, 'local catch-up does not toggle an already playing room');
+});
+
+test('new tracks and loops each retry autoplay even after the previous source was browser-blocked', () => {
+  const b = browser({ blockPlay: true });
+  b.app.connect();
+  const widget = load(b, lobby(b, { generation: 1 }));
+  b.timeout(700);
+  assert.equal(b.app.status().needsAudioClick, true);
+  widget.calls.length = 0;
+  receive(b, lobby(b, { id: 'track-b', position: 0, revision: 2, generation: 2 }));
+  widget.emit(EVENTS.READY);
+  assert.equal(b.widgets.length, 1);
+  assert.ok(widget.calls.some((call) => call.method === 'load'));
+  assert.ok(widget.calls.some((call) => call.method === 'play'));
+  b.timeout(700);
+  widget.calls.length = 0;
+  receive(b, lobby(b, { id: 'track-b', position: 0, revision: 3, generation: 3 }));
+  assert.equal(b.widgets.length, 1);
+  assert.ok(widget.calls.some((call) => call.method === 'seekTo' && call.position === 0));
+  assert.ok(widget.calls.some((call) => call.method === 'play'));
+});
+
+test('native guest play resumes the shared room and both directions obey a cooldown', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b, { playing: false }));
+  resolvePositions(widget);
+  b.messages.length = 0;
+  widget.paused = false;
+  widget.emit(EVENTS.PLAY, { currentPosition: 10000 });
+  assert.equal(b.messages.filter((message) => message.action === 'play').length, 1);
+  receive(b, lobby(b, { playing: true, revision: 2 }));
+  resolvePositions(widget);
+  b.sockets[0].emit('message', { data: JSON.stringify({ type: 'error', code: 'pause_rate_limited', message: 'Please wait.', retryAfterMs: 10000 }) });
+  assert.equal(b.element('play-button').disabled, true);
+  receive(b, lobby(b, { playing: false, revision: 3 }));
+  resolvePositions(widget);
+  assert.equal(b.element('play-button').disabled, true, 'cooldown also disables shared resume');
+  b.messages.length = 0;
+  b.event('play-button', 'click');
+  widget.paused = false;
+  widget.emit(EVENTS.PLAY);
+  resolvePositions(widget);
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
+  assert.equal(widget.paused, true, 'a native click cannot bypass the server cooldown');
+});
+
+test('an authoritative resume starts immediately and a later pause invalidates its delayed getter', () => {
+  const b = browser({ asyncEvents: true });
+  b.app.connect();
+  const widget = load(b, lobby(b, { playing: false }));
+  resolvePositions(widget);
+  b.flushWidgetEvents();
+  widget.calls.length = 0;
+  receive(b, lobby(b, { playing: true, revision: 2 }));
+  assert.equal(widget.paused, false, 'adding or resuming plays without waiting for getPosition');
+  assert.equal(widget.pendingPositions.length, 1);
+  receive(b, lobby(b, { playing: false, revision: 3 }));
+  assert.equal(widget.paused, true, 'an authoritative pause is immediate for every listener');
+  resolvePositions(widget);
+  b.flushWidgetEvents();
+  assert.equal(widget.paused, true);
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
+});
+
+test('the first added song starts at READY after an empty room', () => {
+  const b = browser();
+  b.app.configure({ audioEnabled: false });
+  b.app.connect();
+  const empty = lobby(b, { playing: false });
+  empty.queue = [];
+  empty.currentTrackId = null;
+  receive(b, empty);
+  receive(b, lobby(b, { playing: true, position: 0, revision: 2, generation: 1 }));
+  const widget = b.widgets[0];
+  widget.emit(EVENTS.READY);
+  assert.equal(widget.paused, false);
+  assert.ok(widget.calls.some((call) => call.method === 'play'));
+});
+
+test('late previous-generation PAUSE and FINISH cannot stop or consume a playing loop', () => {
+  const b = browser({ asyncEvents: true });
+  b.app.connect();
+  const widget = load(b, lobby(b, { host: true, generation: 1 }));
+  resolvePositions(widget);
+  b.flushWidgetEvents();
+  receive(b, lobby(b, { host: true, position: 0, revision: 2, generation: 2 }));
+  resolvePositions(widget, 0);
+  b.flushWidgetEvents();
+  b.messages.length = 0;
+  widget.emit(EVENTS.PAUSE, { currentPosition: 240000 }); // Source actually remains playing at zero.
+  widget.emit(EVENTS.FINISH);
+  widget.resolvePosition(0);
+  assert.equal(widget.paused, false);
+  assert.equal(b.hasTimeout(180), false);
+  assert.equal(b.messages.filter((message) => message.type === 'control').length, 0);
+});
+
+test('recent measured end progress validates FINISH when SoundCloud has reset its position', () => {
+  const b = browser();
+  const widget = load(b, lobby(b, { host: true, generation: 4 }));
+  resolvePositions(widget);
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239000 });
+  b.advance(100);
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 239950 });
+  b.messages.length = 0;
+  widget.emit(EVENTS.FINISH);
+  widget.resolvePosition(0);
+  assert.equal(b.messages.find((message) => message.action === 'finish')?.generation, 4);
+});
+
+test('a pending finish confirmation never broadcasts its natural PAUSE before advancing', () => {
+  const b = browser();
+  const widget = load(b, lobby(b, { host: true }));
+  resolvePositions(widget);
+  b.advance(2000);
+  b.messages.length = 0;
+  widget.emit(EVENTS.FINISH);
+  widget.paused = true;
+  widget.emit(EVENTS.PAUSE, { currentPosition: 240000 });
+  assert.equal(b.hasTimeout(180), false);
+  widget.resolvePosition(240000);
+  assert.deepEqual(b.messages.filter((message) => message.type === 'control').map((message) => message.action), ['finish']);
+});
+
+test('room closure clears playback and listeners, stops reconnection and offers a fresh room', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b));
+  b.sockets[0].emit('close', { code: 1006 });
+  assert.equal(b.hasTimeout(600), true);
+  b.app.connect();
+  receive(b, lobby(b, { revision: 2 }));
+  const socket = b.sockets.at(-1);
+  socket.emit('message', { data: JSON.stringify({ type: 'room_closed', message: 'This room closed after 30 minutes without playback.' }) });
+  assert.equal(b.app.status().stopped, true);
+  assert.equal(b.app.status().connected, false);
+  assert.equal(b.app.status().loadedTrackId, null);
+  assert.equal(widget.paused, true);
+  assert.equal(b.hasTimeout(600), false);
+  assert.equal(b.element('room-view').hidden, true);
+  assert.equal(b.element('room-closed-view').hidden, false);
+  assert.match(b.element('room-closed-message').textContent, /30 minutes/);
+  assert.equal(b.element('people').children.length, 0);
+  assert.equal(b.element('queue').children.length, 0);
+  resolvePositions(widget);
+  b.event('new-room-button', 'click');
+  assert.equal(b.element('landing').hidden, false);
+  assert.equal(b.element('room-closed-view').hidden, true);
+});
+
+test('the expired close code stops reconnection even when the final message is lost', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b));
+  b.sockets[0].emit('close', { code: 4004 });
+  assert.equal(b.app.status().stopped, true);
+  assert.equal(widget.paused, true);
+  assert.equal(b.element('room-closed-view').hidden, false);
+  assert.equal(b.hasTimeout(600), false);
+});
+
+test('disconnected listeners disappear and the next active host receives controls immediately', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b));
+  resolvePositions(widget);
+  const state = lobby(b, { host: true, count: 2, revision: 2 });
+  state.members.push({ id: 'old-host', name: 'Gone', connected: false });
+  receive(b, state);
+  assert.equal(b.element('people').children.length, 2);
+  assert.equal(b.element('people-count').textContent, 2);
+  assert.equal(b.element('repeat-button').hidden, false);
+  assert.equal(b.element('shuffle-button').hidden, false);
+  assert.equal(b.element('seek').disabled, false);
+});
+
+test('activity heartbeats require recent advancing audio and contain the measured current-generation position', () => {
+  const b = browser();
+  b.app.connect();
+  const widget = load(b, lobby(b, { generation: 3 }));
+  resolvePositions(widget);
+  b.messages.length = 0;
+  b.interval(10000);
+  assert.equal(b.messages.filter((message) => message.type === 'listening').length, 0, 'server playing and a PLAY event alone do not prove advancing audio');
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 1000 });
+  b.interval(10000);
+  assert.equal(b.messages.filter((message) => message.type === 'listening').length, 0);
+  widget.emit(EVENTS.PLAY_PROGRESS, { currentPosition: 1200 });
+  b.interval(10000);
+  assert.deepEqual(b.messages.find((message) => message.type === 'listening'), { type: 'listening', trackId: 'track-a', generation: 3, positionMs: 1200 });
+  b.messages.length = 0;
+  b.advance(16000);
+  b.interval(10000);
+  assert.equal(b.messages.length, 0, 'stalled audio does not keep an inactive room open');
+  receive(b, lobby(b, { position: 0, generation: 4, revision: 2 }));
+  b.messages.length = 0;
+  b.interval(10000);
+  assert.equal(b.messages.filter((message) => message.type === 'listening').length, 0, 'looping resets old progress evidence');
+});
+
+test('a same-track skip received before the iframe initializes waits for the real READY event', () => {
+  const b = browser();
+  b.app.connect();
+  const state = lobby(b, { generation: 1 });
+  b.app.configure({ room: state, audioEnabled: false });
+  b.app.loadTrack(state.queue[0]);
+  const widget = b.widgets[0];
+  receive(b, lobby(b, { position: 0, revision: 2, generation: 2 }));
+  assert.equal(b.app.status().playerReady, false);
+  assert.equal(widget.calls.filter((call) => call.method === 'play').length, 0);
+  widget.emit(EVENTS.READY);
+  assert.equal(b.app.status().playerReady, true);
+  assert.equal(widget.paused, false);
+  assert.ok(widget.calls.some((call) => call.method === 'seekTo' && call.position === 0));
+});
+
+test('track changes before initial READY wait for the player and load the latest source', () => {
+  const b = browser();
+  b.app.connect();
+  const initial = lobby(b, { generation: 1 });
+  b.app.configure({ room: initial });
+  b.app.loadTrack(initial.queue[0]);
+  const widget = b.widgets[0];
+  receive(b, lobby(b, { id: 'track-b', position: 0, revision: 2, generation: 2 }));
+  receive(b, lobby(b, { id: 'track-b', position: 0, revision: 3, generation: 3 }));
+  assert.equal(widget.calls.filter((call) => call.method === 'load').length, 0);
+  assert.equal(b.app.status().playerReady, false);
+  widget.emit(EVENTS.READY);
+  assert.equal(widget.calls.filter((call) => call.method === 'load').length, 1);
+  assert.equal(widget.url, 'https://soundcloud.com/artist/track-b');
+  assert.equal(b.app.status().playerReady, false);
+  widget.emit(EVENTS.READY);
+  assert.equal(b.app.status().playerReady, true);
+  assert.equal(widget.paused, false);
+  assert.equal(b.widgets.length, 1);
 });
